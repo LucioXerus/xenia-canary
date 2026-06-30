@@ -16,8 +16,12 @@ namespace kernel {
 namespace xam {
 
 dword_result_t XamVoiceIsActiveProcess_entry() {
-  // Returning 0 here will short-circuit a bunch of voice stuff.
-  return 0;
+  // Reports whether the current title owns the active voice process. For a
+  // single running title that is always true. Black Ops 2's voice init spawns a
+  // worker thread that busy-waits on this until it returns non-zero; returning 0
+  // here makes that thread spin forever and blocks the title from presenting
+  // frames (black screen on entering local/splitscreen multiplayer).
+  return 1;
 }
 DECLARE_XAM_EXPORT1(XamVoiceIsActiveProcess, kNone, kStub);
 

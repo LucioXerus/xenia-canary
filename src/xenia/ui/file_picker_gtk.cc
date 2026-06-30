@@ -11,7 +11,6 @@
 
 #include <string>
 
-#include <gdk/gdkx.h>
 #include <gtk/gtk.h>
 
 #include "xenia/base/assert.h"
@@ -71,7 +70,25 @@ bool GtkFilePicker::Show(Window* parent_window) {
       action, "_Cancel", GTK_RESPONSE_CANCEL, confirm_button.c_str(),
       GTK_RESPONSE_ACCEPT, NULL);
 
-  gint res = gtk_dialog_run(GTK_DIALOG(dialog));
+  gtk_file_chooser_set_local_only(GTK_FILE_CHOOSER(dialog), TRUE);
+  const gchar* home_dir = g_get_home_dir();
+  if (home_dir) {
+    gtk_file_chooser_set_current_folder(GTK_FILE_CHOOSER(dialog), home_dir);
+  }
+
+  gtk_widget_show(dialog);
+
+  gint res = GTK_RESPONSE_NONE;
+  g_signal_connect(dialog, "response",
+                   G_CALLBACK(+[](GtkDialog*, gint response, gpointer data) {
+                     *(static_cast<gint*>(data)) = response;
+                   }),
+                   &res);
+
+  while (res == GTK_RESPONSE_NONE) {
+    g_main_context_iteration(nullptr, TRUE);
+  }
+
   char* filename;
   if (res == GTK_RESPONSE_ACCEPT) {
     GtkFileChooser* chooser = GTK_FILE_CHOOSER(dialog);

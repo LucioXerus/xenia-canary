@@ -37,13 +37,6 @@ void GTKWindowedAppContext::NotifyUILoopOfPendingFunctions() {
 }
 
 void GTKWindowedAppContext::PlatformQuitFromUIThread() {
-  if (quit_idle_pending_ || !gtk_main_level()) {
-    return;
-  }
-  gtk_main_quit();
-  // Quit from all loops in the context, current inner, upcoming inner (this is
-  // why the idle function is added even at the main level of 1), until we can
-  // return to the tail of RunMainGTKLoop.
   quit_idle_pending_ = gdk_threads_add_idle(QuitSourceFunc, this);
 }
 

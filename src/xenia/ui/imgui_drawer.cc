@@ -455,6 +455,11 @@ bool ImGuiDrawer::LoadJapaneseFont(ImGuiIO& io, float font_size) {
   FcCharSet* charset = FcCharSetCreate();
   FcCharSetAddChar(charset, 0x4E00);  // Add a CJK character to the charset
   FcPatternAddCharSet(pattern, FC_CHARSET, charset);
+  // Restrict to TrueType (glyf) outlines. ImGui's bundled stb_truetype cannot
+  // parse CFF2 variable fonts (e.g. NotoSansCJK-VF.ttc), which otherwise crash
+  // font atlas building with a parse assertion.
+  FcPatternAddString(pattern, FC_FONTFORMAT,
+                     reinterpret_cast<const FcChar8*>("TrueType"));
 
   // Configure the search
   FcConfigSubstitute(config, pattern, FcMatchPattern);
@@ -467,7 +472,15 @@ bool ImGuiDrawer::LoadJapaneseFont(ImGuiIO& io, float font_size) {
   bool success = false;
   if (font) {
     FcChar8* file = nullptr;
-    if (FcPatternGetString(font, FC_FILE, 0, &file) == FcResultMatch) {
+    FcChar8* format = nullptr;
+    // Only accept TrueType (glyf) fonts; stb_truetype cannot parse CFF2
+    // variable fonts and would abort during atlas build.
+    const bool is_truetype =
+        FcPatternGetString(font, FC_FONTFORMAT, 0, &format) == FcResultMatch &&
+        format &&
+        std::strcmp(reinterpret_cast<const char*>(format), "TrueType") == 0;
+    if (is_truetype &&
+        FcPatternGetString(font, FC_FILE, 0, &file) == FcResultMatch) {
       const char* font_path = reinterpret_cast<const char*>(file);
 
       if (std::filesystem::exists(font_path)) {

@@ -15,11 +15,32 @@
 
 #include <gdk/gdk.h>
 #include <gtk/gtk.h>
+
+#ifdef GDK_WINDOWING_WAYLAND
+#include <gdk/gdkwayland.h>
+#endif
+#ifdef GDK_WINDOWING_X11
+#include <gdk/gdkx.h>
 #include <xcb/xcb.h>
+#endif
 
 #include "xenia/base/platform_linux.h"
 #include "xenia/ui/menu_item.h"
 #include "xenia/ui/window.h"
+
+#ifdef GDK_WINDOWING_WAYLAND
+#include <wayland-client.h>
+
+struct wp_viewporter;
+struct wp_viewport;
+
+// Forward declare protocol interfaces
+struct wl_registry;
+struct wl_subcompositor;
+struct wl_surface;
+struct wl_subsurface;
+struct wp_viewport;
+#endif
 
 namespace xe {
 namespace ui {
@@ -86,6 +107,14 @@ class GTKWindow : public Window {
   uint32_t batched_size_update_depth_ = 0;
   bool batched_size_update_contained_configure_ = false;
   bool batched_size_update_contained_draw_ = false;
+  uint32_t last_drawing_area_width_ = 0;
+  uint32_t last_drawing_area_height_ = 0;
+
+#ifdef GDK_WINDOWING_WAYLAND
+  wl_surface* wayland_subsurface_surface_ = nullptr;
+  wl_subsurface* wayland_subsurface_ = nullptr;
+  wp_viewport* wayland_viewport_ = nullptr;
+#endif
 };
 
 class GTKMenuItem : public MenuItem {

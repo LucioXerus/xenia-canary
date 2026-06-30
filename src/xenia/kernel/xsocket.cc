@@ -358,12 +358,91 @@ X_STATUS XSocket::GetSockName(uint8_t* buf, int* buf_len) {
 }
 
 uint32_t XSocket::GetLastWSAError() const {
-  // Todo(Gliniak): Provide error mapping table
-  // Xbox error codes might not match with what we receive from OS
 #ifdef XE_PLATFORM_WIN32
   return WSAGetLastError();
+#else
+  // The guest expects Winsock (WSAE*) error codes, not host POSIX errno values.
+  // Returning raw errno breaks non-blocking socket handling: e.g. titles test
+  // recv()/connect() failures against WSAEWOULDBLOCK (10035), but Linux reports
+  // EAGAIN (11), so the title never recognizes "retry later" and stalls.
+  switch (errno) {
+    case 0:
+      return 0;
+#if EAGAIN != EWOULDBLOCK
+    case EAGAIN:
 #endif
-  return errno;
+    case EWOULDBLOCK:
+      return 10035;  // WSAEWOULDBLOCK
+    case EINPROGRESS:
+      return 10036;  // WSAEINPROGRESS
+    case EALREADY:
+      return 10037;  // WSAEALREADY
+    case ENOTSOCK:
+      return 10038;  // WSAENOTSOCK
+    case EDESTADDRREQ:
+      return 10039;  // WSAEDESTADDRREQ
+    case EMSGSIZE:
+      return 10040;  // WSAEMSGSIZE
+    case EPROTOTYPE:
+      return 10041;  // WSAEPROTOTYPE
+    case ENOPROTOOPT:
+      return 10042;  // WSAENOPROTOOPT
+    case EPROTONOSUPPORT:
+      return 10043;  // WSAEPROTONOSUPPORT
+    case ESOCKTNOSUPPORT:
+      return 10044;  // WSAESOCKTNOSUPPORT
+    case EOPNOTSUPP:
+      return 10045;  // WSAEOPNOTSUPP
+    case EPFNOSUPPORT:
+      return 10046;  // WSAEPFNOSUPPORT
+    case EAFNOSUPPORT:
+      return 10047;  // WSAEAFNOSUPPORT
+    case EADDRINUSE:
+      return 10048;  // WSAEADDRINUSE
+    case EADDRNOTAVAIL:
+      return 10049;  // WSAEADDRNOTAVAIL
+    case ENETDOWN:
+      return 10050;  // WSAENETDOWN
+    case ENETUNREACH:
+      return 10051;  // WSAENETUNREACH
+    case ENETRESET:
+      return 10052;  // WSAENETRESET
+    case ECONNABORTED:
+      return 10053;  // WSAECONNABORTED
+    case ECONNRESET:
+      return 10054;  // WSAECONNRESET
+    case ENOBUFS:
+      return 10055;  // WSAENOBUFS
+    case EISCONN:
+      return 10056;  // WSAEISCONN
+    case ENOTCONN:
+      return 10057;  // WSAENOTCONN
+    case ESHUTDOWN:
+      return 10058;  // WSAESHUTDOWN
+    case ETIMEDOUT:
+      return 10060;  // WSAETIMEDOUT
+    case ECONNREFUSED:
+      return 10061;  // WSAECONNREFUSED
+    case EHOSTDOWN:
+      return 10064;  // WSAEHOSTDOWN
+    case EHOSTUNREACH:
+      return 10065;  // WSAEHOSTUNREACH
+    case EINTR:
+      return 10004;  // WSAEINTR
+    case EBADF:
+      return 10009;  // WSAEBADF
+    case EACCES:
+      return 10013;  // WSAEACCES
+    case EFAULT:
+      return 10014;  // WSAEFAULT
+    case EINVAL:
+      return 10022;  // WSAEINVAL
+    case EMFILE:
+      return 10024;  // WSAEMFILE
+    default:
+      return static_cast<uint32_t>(errno);
+  }
+#endif
 }
 
 }  // namespace kernel

@@ -23,6 +23,7 @@
 #endif
 #if XE_PLATFORM_GNU_LINUX
 #include "xenia/ui/surface_gnulinux.h"
+#include "xenia/ui/surface_gnulinux_wayland.h"
 #endif
 #if XE_PLATFORM_WIN32
 #include "xenia/ui/surface_win.h"
@@ -211,6 +212,9 @@ Surface::TypeFlags VulkanPresenter::GetSurfaceTypesSupportedByInstance(
 #if XE_PLATFORM_GNU_LINUX
   if (instance_extensions.ext_KHR_xcb_surface) {
     type_flags |= Surface::kTypeFlag_XcbWindow;
+  }
+  if (instance_extensions.ext_KHR_wayland_surface) {
+    type_flags |= Surface::kTypeFlag_WaylandWindow;
   }
 #endif
 #if XE_PLATFORM_WIN32
@@ -600,6 +604,20 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(
         vulkan_surface_create_result =
             ifn.vkCreateXcbSurfaceKHR(instance, &surface_create_info, nullptr,
                                       &paint_context_.vulkan_surface);
+      } break;
+      case Surface::kTypeIndex_WaylandWindow: {
+        auto& wayland_window_surface =
+            static_cast<const WaylandWindowSurface&>(new_surface);
+        VkWaylandSurfaceCreateInfoKHR surface_create_info;
+        surface_create_info.sType =
+            VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR;
+        surface_create_info.pNext = nullptr;
+        surface_create_info.flags = 0;
+        surface_create_info.display = wayland_window_surface.display();
+        surface_create_info.surface = wayland_window_surface.surface();
+        vulkan_surface_create_result = ifn.vkCreateWaylandSurfaceKHR(
+            instance, &surface_create_info, nullptr,
+            &paint_context_.vulkan_surface);
       } break;
 #endif
 #if XE_PLATFORM_WIN32

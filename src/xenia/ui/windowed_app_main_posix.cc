@@ -17,12 +17,10 @@
 #include "xenia/ui/windowed_app_context_gtk.h"
 
 int main(int argc_pre_gtk, char** argv_pre_gtk) {
-  // Before touching anything GTK+, make sure that when running on Wayland,
-  // we'll still get an X11 (Xwayland) window
-  // also allow users to override this
-  if (!secure_getenv("GDK_BACKEND")) {
-    setenv("GDK_BACKEND", "x11", 1);
-  }
+  // Allow native Wayland by checking GDK_BACKEND first - if not set,
+  // don't force x11, let GTK auto-detect (Wayland preferred if available).
+  // Users can still override with GDK_BACKEND=x11 for Xwayland if needed.
+  // The existing GDK_BACKEND setting is respected if already set.
 
   // Initialize GTK+, which will handle and remove its own arguments from argv.
   // Both GTK+ and Xenia use --option=value argument format (see man
