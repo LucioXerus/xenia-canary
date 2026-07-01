@@ -57,8 +57,11 @@ GTKWindow::~GTKWindow() {
   }
 #endif
   if (window_) {
+    // Set window_ to null to ignore events from now on since this ui::GTKWindow
+    // is entering an indeterminate state.
     GtkWidget* window = window_;
     window_ = nullptr;
+    // Destroying the top-level window also destroys its children.
     drawing_area_ = nullptr;
     box_ = nullptr;
     gtk_widget_destroy(window);
@@ -70,20 +73,33 @@ bool GTKWindow::OpenImpl() {
 
   gtk_window_set_title(GTK_WINDOW(window_), GetTitle().c_str());
 
+  // Create the vertical box container for the main menu and the drawing area.
   box_ = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
   gtk_container_add(GTK_CONTAINER(window_), box_);
 
+  // Add the main menu (even if fullscreen was requested, for the initial layout
+  // calculation).
   const auto* main_menu = dynamic_cast<const GTKMenuItem*>(GetMainMenu());
   GtkWidget* main_menu_widget = main_menu ? main_menu->handle() : nullptr;
   if (main_menu_widget) {
     gtk_box_pack_start(GTK_BOX(box_), main_menu_widget, false, false, 0);
   }
 
+  // Create the drawing area for creating the surface for, which will be the
+  // client area of the window occupying all the window space not taken by the
+  // main menu.
   drawing_area_ = gtk_drawing_area_new();
   gtk_box_pack_end(GTK_BOX(box_), drawing_area_, true, true, 0);
+  // The desired size is the client (drawing) area size. Let GTK auto-size the
+  // entire window around it (as well as the width of the menu actually if it
+  // happens to be bigger - the desired size in the Window will be updated later
+  // to reflect that).
   gtk_widget_set_size_request(drawing_area_, GetDesiredLogicalWidth(),
                               GetDesiredLogicalHeight());
 
+  // Attach the event handlers.
+  // Keyboard events are processed by the window, mouse events are processed
+  // within, and by, the drawing (client) area.
   gtk_widget_set_events(window_, GDK_KEY_PRESS_MASK | GDK_KEY_RELEASE_MASK |
                                      GDK_FOCUS_CHANGE_MASK);
   gtk_widget_set_events(drawing_area_,
@@ -108,6 +124,7 @@ bool GTKWindow::OpenImpl() {
                      reinterpret_cast<gpointer>(this));
   }
 
+  // Finally show all the widgets in the window, including the main menu.
   gtk_widget_show_all(window_);
 
 #ifdef GDK_WINDOWING_WAYLAND
@@ -123,8 +140,6 @@ bool GTKWindow::OpenImpl() {
         struct wl_registry* registry = wl_display_get_registry(display);
         struct wl_subcompositor* subcompositor = nullptr;
         struct wp_viewporter* viewporter = nullptr;
-        uint32_t subcompositor_name = 0;
-        uint32_t viewporter_name = 0;
         auto registry_handler = [](void* data, struct wl_registry* registry,
                                    uint32_t name, const char* interface,
                                    uint32_t) {
@@ -181,6 +196,12 @@ bool GTKWindow::OpenImpl() {
             }
           }
           wl_subcompositor_destroy(subcompositor);
+        } else {
+          XELOGE(
+              "GTKWindow: Wayland compositor does not support "
+              "wl_subcompositor, cannot create rendering subsurface");
+          wl_surface_destroy(wayland_subsurface_surface_);
+          wayland_subsurface_surface_ = nullptr;
         }
         if (viewporter) {
           wp_viewporter_destroy(viewporter);
@@ -190,8 +211,12 @@ bool GTKWindow::OpenImpl() {
   }
 #endif
 
+  // Remove the size request after finishing the initial layout because it makes
+  // it impossible to make the window smaller.
   gtk_widget_set_size_request(drawing_area_, -1, -1);
 
+  // After setting up the initial layout for non-fullscreen, enter fullscreen if
+  // requested.
   if (IsFullscreen()) {
     if (main_menu_widget) {
       gtk_container_remove(GTK_CONTAINER(box_), main_menu_widget);
@@ -199,8 +224,12 @@ bool GTKWindow::OpenImpl() {
     gtk_window_fullscreen(GTK_WINDOW(window_));
   }
 
+  // Make sure the initial state after opening is reported to the common Window
+  // class no matter how GTK sends the events.
   {
     WindowDestructionReceiver destruction_receiver(this);
+
+    // TODO(Triang3l): Report the desired client area size.
 
     GtkAllocation drawing_area_allocation;
     gtk_widget_get_allocation(drawing_area_, &drawing_area_allocation);
@@ -368,8 +397,11 @@ std::unique_ptr<Surface> GTKWindow::CreateSurfaceImpl(
           wayland_subsurface_surface_
               ? wayland_subsurface_surface_
               : gdk_wayland_window_get_wl_surface(drawing_area_window);
+      GtkAllocation allocation;
+      gtk_widget_get_allocation(drawing_area_, &allocation);
       return std::make_unique<WaylandWindowSurface>(
-          gdk_wayland_display_get_wl_display(display), surface, drawing_area_);
+          gdk_wayland_display_get_wl_display(display), surface,
+          uint32_t(allocation.width), uint32_t(allocation.height));
     }
   }
 #endif
@@ -406,8 +438,13 @@ void GTKWindow::RequestPaintImpl() {
 void GTKWindow::HandleSizeUpdate(
     WindowDestructionReceiver& destruction_receiver) {
   if (!drawing_area_) {
+    // Batched size update ended when the window has already been closed, for
+    // instance.
     return;
   }
+
+  // TODO(Triang3l): Report the desired client area size.
+
   GtkAllocation drawing_area_allocation;
   gtk_widget_get_allocation(drawing_area_, &drawing_area_allocation);
   uint32_t width = uint32_t(drawing_area_allocation.width);
@@ -797,8 +834,12 @@ gboolean GTKWindow::WindowEventHandler(GdkEvent* event) {
       if (destruction_receiver.IsWindowDestroyed()) {
         break;
       }
+      // Set window_ to null to ignore events from now on since this
+      // ui::GTKWindow is entering an indeterminate state - this should be done
+      // at some point in closing anyway.
       GtkWidget* window = window_;
       window_ = nullptr;
+      // Destroying the top-level window also destroys its children.
       drawing_area_ = nullptr;
       box_ = nullptr;
 #ifdef GDK_WINDOWING_WAYLAND

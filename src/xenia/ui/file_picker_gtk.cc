@@ -76,14 +76,21 @@ bool GtkFilePicker::Show(Window* parent_window) {
     gtk_file_chooser_set_current_folder(GTK_FILE_CHOOSER(dialog), home_dir);
   }
 
-  gtk_widget_show(dialog);
-
   gint res = GTK_RESPONSE_NONE;
   g_signal_connect(dialog, "response",
                    G_CALLBACK(+[](GtkDialog*, gint response, gpointer data) {
                      *(static_cast<gint*>(data)) = response;
                    }),
                    &res);
+  g_signal_connect(
+      dialog, "delete-event",
+      G_CALLBACK(+[](GtkWidget*, GdkEvent*, gpointer data) -> gboolean {
+        *(static_cast<gint*>(data)) = GTK_RESPONSE_DELETE_EVENT;
+        return GDK_EVENT_STOP;
+      }),
+      &res);
+
+  gtk_widget_show(dialog);
 
   while (res == GTK_RESPONSE_NONE) {
     g_main_context_iteration(nullptr, TRUE);

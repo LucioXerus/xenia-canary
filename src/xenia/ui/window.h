@@ -536,7 +536,6 @@ class Window {
 
   Presenter* presenter() const { return presenter_; }
   bool HasSurface() const { return presenter_surface_ != nullptr; }
-  Surface* GetSurface() const { return presenter_surface_.get(); }
   // If new_surface_potentially_exists is false, creation of the new surface for
   // the window won't be updated, and it may be called from the destructor (via
   // EnterDestructor to destroy the surface before destroying what it depends

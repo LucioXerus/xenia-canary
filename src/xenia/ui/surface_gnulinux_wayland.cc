@@ -9,21 +9,16 @@
 
 #include "xenia/ui/surface_gnulinux_wayland.h"
 
-#include <gtk/gtk.h>
-
 namespace xe {
 namespace ui {
 
 WaylandWindowSurface::WaylandWindowSurface(wl_display* display,
                                            wl_surface* surface,
-                                           GtkWidget* drawing_area)
-    : display_(display), surface_(surface), drawing_area_(drawing_area) {
-  if (drawing_area_) {
-    GtkAllocation allocation;
-    gtk_widget_get_allocation(drawing_area_, &allocation);
-    width_.store(allocation.width);
-    height_.store(allocation.height);
-  }
+                                           uint32_t initial_width,
+                                           uint32_t initial_height)
+    : display_(display), surface_(surface) {
+  width_.store(initial_width);
+  height_.store(initial_height);
 }
 
 void WaylandWindowSurface::OnSizeUpdate(uint32_t width, uint32_t height) {

@@ -13,8 +13,6 @@
 #include <atomic>
 #include <cstdint>
 
-#include <gdk/gdk.h>
-#include <gtk/gtk.h>
 #include <wayland-client.h>
 
 #include "xenia/ui/surface.h"
@@ -25,7 +23,7 @@ namespace ui {
 class WaylandWindowSurface final : public Surface {
  public:
   WaylandWindowSurface(wl_display* display, wl_surface* surface,
-                       GtkWidget* drawing_area);
+                       uint32_t initial_width, uint32_t initial_height);
   TypeIndex GetType() const override { return kTypeIndex_WaylandWindow; }
   wl_display* display() const { return display_; }
   wl_surface* surface() const { return surface_; }
@@ -38,7 +36,6 @@ class WaylandWindowSurface final : public Surface {
  private:
   wl_display* display_;
   wl_surface* surface_;
-  GtkWidget* drawing_area_;
   std::atomic<uint32_t> width_;
   std::atomic<uint32_t> height_;
 };

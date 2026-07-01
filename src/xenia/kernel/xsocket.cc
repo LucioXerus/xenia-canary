@@ -389,8 +389,10 @@ uint32_t XSocket::GetLastWSAError() const {
       return 10042;  // WSAENOPROTOOPT
     case EPROTONOSUPPORT:
       return 10043;  // WSAEPROTONOSUPPORT
+#ifdef ESOCKTNOSUPPORT
     case ESOCKTNOSUPPORT:
       return 10044;  // WSAESOCKTNOSUPPORT
+#endif
     case EOPNOTSUPP:
       return 10045;  // WSAEOPNOTSUPP
     case EPFNOSUPPORT:

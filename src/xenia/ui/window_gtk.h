@@ -33,13 +33,6 @@
 
 struct wp_viewporter;
 struct wp_viewport;
-
-// Forward declare protocol interfaces
-struct wl_registry;
-struct wl_subcompositor;
-struct wl_surface;
-struct wl_subsurface;
-struct wp_viewport;
 #endif
 
 namespace xe {
