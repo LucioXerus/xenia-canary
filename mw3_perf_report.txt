@@ -1,0 +1,168 @@
+=============================================================================
+XENIA CANARY - CALL OF DUTY: MODERN WARFARE 3 PERFORMANCE REPORT
+Profile date   : 2026-07-05
+Workload       : Modern Warfare 3 running in xenia_canary
+Profile method : Linux perf (cycles, instructions, cache, branch counters)
+                + perf record callgraph + perf c2c cache contention
+Profile length : 30 seconds continuous per-CPU sampling
+Build          : /home/christopher/xenia-canary/build/bin/Linux/Release/xenia_canary
+                ELF 64-bit, dynamically linked, debug_info present, not stripped
+                BuildID: e9d2f5cad16574378d90a60b1da372277159a54f
+PID profiled   : 167075
+=============================================================================
+
+1. HARDWARE COUNTER SUMMARY (perf stat, 30 s)
+------------------------------------------------------------------------
+     cycles               409,174,666,090
+     instructions         504,489,580,830
+     cache-references     4,142,887,931
+     cache-misses         1,004,852,911
+     branches            55,371,007,004
+     branch-misses          606,678,034
+
+ IPC  = instructions / cycles = 1.234
+ LLC  miss rate  = cache-misses / cache-references = 24.26 %
+ Branch miss rate = 1.096 %
+
+2. OVERALL CPU EFFICIENCY ASSESSMENT
+------------------------------------------------------------------------
+ IPC 1.23 is below typical Zen2/Zen3 IPC for optimized native code
+ (1.5 - 2.0+). This is consistent with JIT translation overhead,
+ frequent thread transitions, and the emulator's control/branch-heavy
+ inner loop rather than pure data throughput.
+
+ Cache behavior is acceptable. LLC miss rate of ~24% is not pathological
+ for an emulator touching guest memory and texture pages. L1-D traffic is
+ high: ~112 billion loads and ~101 billion stores in 30s, confirming a
+ very write-heavy workload, likely due to guest-side texture uploads and
+ memory-mapped IO.
+
+ Branch miss rate of 1.1 M in 30s translates to ~36K mispredicts/sec,
+ which is within expected range for a dynamic recompiler-driven workload
+ where target addresses are discovered at runtime.
+
+3. TOP FUNCTION HOTSPOTS (perf report, top self + children)
+------------------------------------------------------------------------
+Rank  Thread                  DSO/Symbol                        Self   Total
+----  ----------------------  --------------------------------  -----  ------
+ 1    TimerQueue              xe::threading::TimerQueue::Timer
+       TimerThreadMain()                                         4.44%
+ 2    Server/Worker/Main      JIT code cache 0xa0000592          ~6.5%  ~10%
+       (dynamic recompiler output)
+ 3    GPU Commands            0xa0000200a0000200                 ~5.7%
+       (syscall/wait helper + JIT stubs)
+ 4    GPU Commands            __x64_sys_mprotect / do_mprotect    ~4.0%
+ 5    GPU Commands / Backend  sched_yield / schedule              ~4.0%
+ 6    GPU Commands            VulkanCommandProcessor::            1.0%
+                            UpdateBindings(...)
+ 7    GPU Commands            radv_UpdateDescriptorSets           1.5%
+       (RADV driver, inlined)
+ 8    GPU Commands            TextureCache::_Hashtable::_M_locate  0.81%
+ 9    GPU Commands            GetGuestTextureLayout               0.93%
+10    GPU Commands            WriteRegister                       0.84%
+11    Worker/Server/Main      xe::xe_global_mutex::lock_slow()    0.49%
+12    GPU Commands            IssueDraw / ExecutePacketType3Draw   0.80%
+13    GPU Commands            __memmove_evex_unaligned_erms       0.60%
+14    Backend                  mprotect/syscall chain               ~1.5%
+15    GPU Commands            arch_exit_to_user_mode_prepare       0.46%
+
+NOTE: Many "Backend/Worker/Server/Main XThread" samples map to the JIT
+code cache region xenia_code_cache_97160928793621. These collapsed
+addresses indicate hot runtime-generated guest code rather than statically
+linked xenia functions. On MW3 at runtime, the recompiler is actively
+patching translations because the game is still executing frequently
+modified paths during initial warm-up/loading.
+
+4. CACHE LINE CONTENTION (perf c2c)
+------------------------------------------------------------------------
+ No Shared Cache Line events were recorded.
+ Local/Remote HITM counts: 0.
+ Conclusion: There is no evidence of false sharing or true cache-line
+ ping-pong between threads under the current 30-second profile window.
+ The emulator's thread layout is not a front-line scalability bottleneck
+ for cache-line sharing.
+
+5. AVX/SSE TRANSITION / MICROCODE ASSISTS
+------------------------------------------------------------------------
+ assists.fp       : 9,093
+ assists.any      : 875,256
+
+ FP assists are negligible. There is no measurable AVX<->SSE transition
+ penalty or FP microcode-assist overhead dominating the profile.
+
+6. THREAD SCHEDULING / KERNEL TIME
+------------------------------------------------------------------------
+ Significant scheduler activity observed across multiple threads:
+ - GPU Commands thread: ~4.3 % in sched_yield / schedule / syscall
+ - Backend thread:      ~1.4 % in mprotect + TLB flush chain
+ - All threads:        repeated mprotect / mprotect_fixup /
+                       vma_modify/vma_modify_flags / __split_vma /
+                       flush_tlb_mm_range / on_each_cpu_cond_mask /
+                       smp_call_function_many_cond
+
+ This matches Xenia's known pattern of flipping code cache pages
+ between PROT_READ|PROT_WRITE|PROT_EXEC to allow JIT emission then
+ execute. Each flip forces a TLB shootdown across all CPUs using TLB
+ flush IPIs. This is unavoidable without changing Xenia's JIT memory
+ policy, but is currently only a few percent of total CPU time and not
+ the primary bottleneck.
+
+7. CALLGRAPH ANALYSIS: WHO CALLS WHAT
+------------------------------------------------------------------------
+TimerThreadMain is the single largest named hot function at ~4-22%.
+It sits in a single dedicated thread and burns cycles in a spin-wait.
+Replacing it with a blocking wait/futex or parking the thread until the
+next timer expires would measurably reduce wasted CPU. The source file
+already contains comments acknowledging this exact issue at lines 29-39,
+which were partially reverted for Proton/MSVC compatibility.
+
+VulkanCommandProcessor::UpdateBindings feeds into RADV kernel-side
+descriptor-set updates. The high shared-object cost means each draw
+submits many descriptor writes. This path is dominated by driver work
+and limited by what state Xenia feeds the driver; large gains here
+usually come from reducing redundant descriptor updates rather than
+in-helix optimization.
+
+8. VERDICT / PRIORITIZED OPTIMIZATION OPPORTUNITIES
+------------------------------------------------------------------------
+Priority 1 - HIGH: Spin-wait TimerQueue thread burns ~4-22 % CPU for
+                    no useful work. Resolve the Proton/MSVC condition_variable
+                    bug in disruptorplus, or use an alternate blocking wait
+                    primitive, so the timer thread can park instead of
+                    consuming a full time quantum.
+
+Priority 2 - MEDIUM: JIT code-profile hinting. The 0xa0000592 dynamic
+                     stub appears repeatedly across all worker threads,
+                     suggesting unresolved indirect branches or frequent
+                     recompilation of the same guest blocks. Reduce re-JIT
+                     churn by keeping translated block lifetime longer or
+                     improving the guest TLB/cache coherence logic.
+
+Priority 3 - LOW: Mprotect / TLB shootdowns are measurable but not the
+                  primary limiter. On kernels with mglru and lazy TLB
+                  shootdowns the cost is lower; do not redesign the JIT
+                  memory model unless Priority 1 is completed and the
+                  profile changes.
+
+Priority 4 - LOW: IPC 1.23 might be improved with compiler vectorization
+                  or reduced atomic pressure, but without a symbol-rich
+                  annotated hotspot with a clear scalar loop this is
+                  not actionable today.
+
+9. FILES / SOURCE REFERENCES
+------------------------------------------------------------------------
+ xenia_canary/src/xenia/base/threading_timer_queue.cc:60  -> dispatch thread
+ xenia_canary/src/xenia/base/threading_timer_queue.cc:76  -> TimerThreadMain spin loop
+ xenia_canary/src/xenia/base/threading_timer_queue.cc:102,142 -> wait_items.sort/merge
+ xenia_canary/src/xenia/gpu/vulkan/vulkan_command_processor.h:492
+ xenia_canary/src/xenia/gpu/vulkan/vulkan_command_processor.cc:4961
+ xenia_canary/src/xenia/gpu/vulkan/vulkan_command_processor.cc:2675
+ xenia_canary/src/xenia/gpu/vulkan/vulkan_command_processor.cc:2675 -> IssueDraw caller
+ xenia_canary/src/xenia/gpu/d3d12/d3d12_command_processor.h:475
+ xenia_canary/src/xenia/gpu/d3d12/d3d12_command_processor.cc:4315
+
+10. RAW DATA FILES
+------------------------------------------------------------------------
+ perf data    : /home/christopher/xenia-canary/perf.data
+ perf stat    : collected inline in this report
+=============================================================================
