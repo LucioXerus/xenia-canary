@@ -50,6 +50,17 @@ DEFINE_bool(clear_memory_page_state, false,
             "for 'Team Ninja' Games to fix missing character models)",
             "GPU");
 
+DEFINE_uint32(
+    gpu_worker_spin_count, 40,
+    "Number of times the GPU command processor busy-waits (sched_yield) for "
+    "new ring-buffer commands before parking on its wait event. When the GPU "
+    "is starved (common in CPU-bound scenes) this busy-wait burns CPU for no "
+    "useful work; parking sooner lowers CPU usage at the cost of slightly "
+    "higher command kickoff latency. The event is signaled immediately when "
+    "the guest submits new commands, so parking is prompt. Set to 0 to always "
+    "park immediately. The historical value was 500.",
+    "GPU");
+
 DEFINE_string(
     occlusion_query, "fast",
     "Controls hardware occlusion query behavior for EVENT_WRITE_ZPD.\n"
@@ -332,10 +343,19 @@ void CommandProcessor::WorkerThreadMain() {
       // We spin here waiting for new ones, as the overhead of waiting on our
       // event is too high.
       PrepareForWait();
+      // Busy-wait briefly for new commands before parking on the event. Each
+      // MaybeYield() is a sched_yield() syscall, so a long spin here shows up as
+      // wasted CPU when the GPU is starved. The wait event is signaled the
+      // instant the guest submits new commands (see UpdateWritePointer), so
+      // parking is prompt; the spin only saves the wake latency in the common
+      // case where commands arrive within a few microseconds.
+      const uint32_t spin_count = cvars::gpu_worker_spin_count;
       uint32_t loop_count = 0;
       do {
-        // If we spin around too much, revert to a "low-power" state.
-        if (loop_count > 500) {
+        // Once we've spun long enough, revert to a "low-power" state and block
+        // on the event (with a short timeout so we periodically re-check
+        // worker_running_ / pending_fns_).
+        if (loop_count >= spin_count) {
           constexpr int wait_time_ms = 2;
           xe::threading::Wait(write_ptr_index_event_.get(), true,
                               std::chrono::milliseconds(wait_time_ms));

@@ -9,13 +9,14 @@
 
 #include <forward_list>
 
-#include "third_party/disruptorplus/include/disruptorplus/blocking_wait_strategy.hpp"
+#include "third_party/disruptorplus/include/disruptorplus/blocking_wait_strategy.hpp"  // IWYU pragma: keep
 #include "third_party/disruptorplus/include/disruptorplus/multi_threaded_claim_strategy.hpp"
 #include "third_party/disruptorplus/include/disruptorplus/ring_buffer.hpp"
 #include "third_party/disruptorplus/include/disruptorplus/sequence_barrier.hpp"
 #include "third_party/disruptorplus/include/disruptorplus/spin_wait.hpp"
 #include "third_party/disruptorplus/include/disruptorplus/spin_wait_strategy.hpp"
 #include "xenia/base/assert.h"
+#include "xenia/base/platform.h"
 #include "xenia/base/threading.h"
 #include "xenia/base/threading_timer_queue.h"
 
@@ -42,7 +43,26 @@ using WaitItem = TimerQueueWaitItem;
     edit2: (30.12.2024) After uplifting version of MSVC compiler Xenia cannot be
    correctly initialized if you're using proton.
 */
+
+/*
+    edit3: (2026-07-05) Profiling MW3 on a native Linux build showed the
+   dispatch thread's spin-wait burning ~4-22% of total CPU for no useful work
+   (mostly sched_yield). The only recurring timer in normal gameplay is a 1ms
+   guest-timestamp tick, so the thread should simply park until the next due
+   time instead of busy-waiting.
+
+   The blocking wait strategy uses a condition_variable and is only re-enabled
+   on non-Windows targets. Proton runs the *Windows* build under Wine, so that
+   path keeps the proven spin-wait strategy from edit2 and is unaffected. The
+   condition_variable::wait_until overflow that plagued the earlier attempts is
+   avoided by never passing clock::time_point::max() to the wait (see
+   TimerThreadMain).
+*/
+#if XE_PLATFORM_WIN32
 using WaitStrat = dp::spin_wait_strategy;
+#else
+using WaitStrat = dp::blocking_wait_strategy;
+#endif
 
 class TimerQueue {
  public:
@@ -84,11 +104,21 @@ class TimerQueue {
 
     while (!shutdown_.load(std::memory_order_relaxed)) {
       {
-        // Consume new wait items and add them to sorted wait queue
+        // Consume new wait items and add them to sorted wait queue.
+        //
+        // When the queue is empty we still cap the wait to a finite bound
+        // instead of clock::time_point::max(): the blocking wait strategy hands
+        // this to std::condition_variable::wait_until(), and max() overflows
+        // during the internal clock conversion on some STL implementations.
+        // Shutdown wakes this thread immediately via QueueTimer(), so this bound
+        // only affects a fully idle queue (it re-checks the shutdown flag once
+        // per interval). It has no effect on the spin wait strategy.
+        constexpr auto kMaxIdleWait = std::chrono::seconds(1);
+        const clock::time_point timeout =
+            wait_queue_.empty() ? clock::now() + kMaxIdleWait
+                                : wait_queue_.front()->due_;
         dp::sequence_t available = claim_strategy_.wait_until_published(
-            next_sequence, next_sequence - 1,
-            wait_queue_.empty() ? clock::time_point::max()
-                                : wait_queue_.front()->due_);
+            next_sequence, next_sequence - 1, timeout);
 
         // Check for timeout
         if (available != next_sequence - 1) {

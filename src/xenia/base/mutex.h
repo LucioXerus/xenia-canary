@@ -138,17 +138,23 @@ class xe_unlikely_mutex {
     if (XE_LIKELY(_tryget())) {
       return;
     }
-    // Spin a bit before yielding
+    // Spin a bit before yielding. Test-and-test-and-set: only attempt the CAS
+    // (_tryget) once a relaxed load shows the lock is free, to avoid the
+    // cache-line contention and memory-ordering machine clears of a
+    // CAS-per-iteration spin.
     for (int i = 0; i < XE_LINUX_MUTEX_SPINCOUNT; ++i) {
 #if XE_ARCH_AMD64 == 1
       _mm_pause();
 #endif
-      if (_tryget()) {
+      if (mut.load(std::memory_order_relaxed) == 0 && _tryget()) {
         return;
       }
     }
     // Fall back to yielding
-    while (!_tryget()) {
+    while (true) {
+      if (mut.load(std::memory_order_relaxed) == 0 && _tryget()) {
+        return;
+      }
       std::this_thread::yield();
     }
   }

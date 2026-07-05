@@ -117,17 +117,24 @@ void xe_global_mutex::lock() {
 void xe_global_mutex::lock_slow() {
   pid_t self = gettid();
 
-  // Spin phase
+  // Spin phase (test-and-test-and-set). Spin on a relaxed *load* and only
+  // attempt the compare_exchange once the lock looks free. A CAS on every spin
+  // iteration takes the cache line for writing (RFO) even while the lock is
+  // held, so all waiting cores fight over the line and the CPU racks up
+  // memory-ordering machine clears. Reading first keeps the line in a shared
+  // state until there is a real chance of acquiring it.
   for (int i = 0; i < XE_LINUX_MUTEX_SPINCOUNT; ++i) {
 #if XE_ARCH_AMD64 == 1
     _mm_pause();
 #endif
-    uint32_t expected = 0;
-    if (state_.compare_exchange_strong(expected, 1, std::memory_order_acquire,
-                                       std::memory_order_relaxed)) {
-      owner_.store(self, std::memory_order_relaxed);
-      recursion_count_ = 1;
-      return;
+    if (state_.load(std::memory_order_relaxed) == 0) {
+      uint32_t expected = 0;
+      if (state_.compare_exchange_strong(expected, 1, std::memory_order_acquire,
+                                         std::memory_order_relaxed)) {
+        owner_.store(self, std::memory_order_relaxed);
+        recursion_count_ = 1;
+        return;
+      }
     }
   }
 
@@ -201,15 +208,20 @@ void xe_fast_mutex::lock() {
 }
 
 void xe_fast_mutex::lock_slow() {
-  // Spin phase
+  // Spin phase (test-and-test-and-set). See xe_global_mutex::lock_slow above
+  // for why we load before attempting the CAS: it avoids the cache-line
+  // ping-pong and memory-ordering machine clears that a CAS-per-iteration spin
+  // causes under contention.
   for (int i = 0; i < XE_LINUX_MUTEX_SPINCOUNT; ++i) {
 #if XE_ARCH_AMD64 == 1
     _mm_pause();
 #endif
-    uint32_t expected = 0;
-    if (state_.compare_exchange_strong(expected, 1, std::memory_order_acquire,
-                                       std::memory_order_relaxed)) {
-      return;
+    if (state_.load(std::memory_order_relaxed) == 0) {
+      uint32_t expected = 0;
+      if (state_.compare_exchange_strong(expected, 1, std::memory_order_acquire,
+                                         std::memory_order_relaxed)) {
+        return;
+      }
     }
   }
 
