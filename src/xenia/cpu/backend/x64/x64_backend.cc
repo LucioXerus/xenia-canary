@@ -14,8 +14,10 @@
 #include "third_party/capstone/include/capstone/x86.h"
 
 #include "xenia/base/exception_handler.h"
+#include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
 #include "xenia/cpu/backend/x64/x64_assembler.h"
+#include "xenia/cpu/backend/x64/x64_aot_cache.h"
 #include "xenia/cpu/backend/x64/x64_code_cache.h"
 #include "xenia/cpu/backend/x64/x64_emitter.h"
 #include "xenia/cpu/backend/x64/x64_function.h"
@@ -27,6 +29,13 @@
 #include "xenia/cpu/xex_module.h"
 
 DECLARE_bool(record_mmio_access_exceptions);
+
+DEFINE_bool(aot_cache, true, "Persist recompiled PPC->x64 code to disk and "
+            "reload it on subsequent launches.", "CPU");
+DEFINE_bool(aot_preload_on_launch, true, "Bulk-load the AOT cache with a "
+            "progress screen at title launch.", "CPU");
+DEFINE_string(aot_cache_path, "", "Override AOT cache directory (default: "
+              "<content_root>/aot_cache).", "CPU");
 
 DEFINE_int64(max_stackpoints, 65536,
              "Max number of host->guest stack mappings we can record.", "x64");
@@ -285,6 +294,25 @@ bool X64Backend::Initialize(Processor* processor) {
   vrsqrtefp_vector_helper =
       thunk_emitter.EmitVectorVRsqrteHelper(vrsqrtefp_scalar_helper);
   frsqrtefp_helper = thunk_emitter.EmitFrsqrteHelper();
+
+  // Set code cache back-pointer to this backend (used by AOT hook).
+  code_cache_->set_backend(this);
+
+  // Initialize the AOT persistent cache if enabled.
+  if (cvars::aot_cache) {
+    std::filesystem::path cache_path =
+        xe::filesystem::GetExecutableFolder() / "aot_cache";
+    if (!cvars::aot_cache_path.empty()) {
+      cache_path = xe::to_path(cvars::aot_cache_path);
+    }
+    aot_cache_ = std::make_unique<X64AOTCache>(this, code_cache_.get());
+    if (!aot_cache_->Initialize(cache_path)) {
+      XELOGE("AOT: Failed to initialize cache, disabling");
+      aot_cache_->set_enabled(false);
+    } else {
+      XELOGCPU("AOT: Cache enabled at {}", cache_path.string());
+    }
+  }
   // Set the code cache to use the ResolveFunction thunk for default
   // indirections.
   assert_zero(uint64_t(resolve_function_thunk_) & 0xFFFFFFFF00000000ull);
@@ -1848,6 +1876,18 @@ void X64Backend::FreeGuestTrampoline(uint32_t trampoline_addr) {
       (trampoline_addr - GUEST_TRAMPOLINE_BASE) / GUEST_TRAMPOLINE_MIN_LEN;
   guest_trampoline_address_bitmap_.Release(index);
 }
+size_t X64Backend::PreloadAOTCache(Module* module, uint32_t title_id) {
+  if (!aot_cache_ || !aot_cache_->enabled()) {
+    return 0;
+  }
+  auto* xex = dynamic_cast<XexModule*>(module);
+  if (!xex || !xex->image_sha_bytes()) {
+    return 0;
+  }
+  return aot_cache_->PreloadModule(module, title_id, xex->image_sha_bytes(),
+                                    nullptr);
+}
+
 }  // namespace x64
 }  // namespace backend
 }  // namespace cpu

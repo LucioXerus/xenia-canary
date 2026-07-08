@@ -24,6 +24,8 @@
 #include "xenia/base/memory.h"
 #include "xenia/base/profiling.h"
 #include "xenia/base/vec128.h"
+#include "xenia/cpu/backend/x64/x64_assembler.h"
+#include "xenia/cpu/backend/x64/x64_aot_cache.h"
 #include "xenia/cpu/backend/x64/x64_backend.h"
 #include "xenia/cpu/backend/x64/x64_code_cache.h"
 #include "xenia/cpu/backend/x64/x64_function.h"
@@ -120,6 +122,12 @@ bool X64Emitter::Emit(GuestFunction* function, HIRBuilder* builder,
   debug_info_flags_ = debug_info_flags;
   trace_data_ = &function->trace_data();
   source_map_arena_.Reset();
+
+  // Begin AOT recording (captures host pointer relocations).
+  auto* aot = backend_ ? backend_->aot_cache() : nullptr;
+  if (aot && aot->enabled()) {
+    aot->recorder()->Begin();
+  }
 
   // Fill the generator with code.
   EmitFunctionInfo func_info = {};
@@ -798,6 +806,8 @@ uint64_t UndefinedCallExtern(void* raw_context, uint64_t function_ptr) {
 }
 void X64Emitter::CallExtern(const hir::Instr* instr, const Function* function) {
   ForgetMxcsrMode();
+
+  auto* rec = backend_ && backend_->aot_cache() ? backend_->aot_cache()->recorder() : nullptr;
   bool undefined = true;
   if (function->behavior() == Function::Behavior::kBuiltin) {
     auto builtin_function = static_cast<const BuiltinFunction*>(function);
@@ -807,9 +817,29 @@ void X64Emitter::CallExtern(const hir::Instr* instr, const Function* function) {
       // rdx = arg0
       // r8  = arg1
       // r9  = arg2
+
+      // AOT: record host pointers baked as immediates.
+      if (rec && rec->active()) {
+        rec->RecordHostPtr(static_cast<uint32_t>(getSize() + 2),
+                           reinterpret_cast<void*>(builtin_function->handler()),
+                           AOTRelocKind::kBuiltinHandler, 8);
+      }
       mov(rcx, reinterpret_cast<uint64_t>(builtin_function->handler()));
+
+      if (rec && rec->active()) {
+        rec->RecordHostPtr(static_cast<uint32_t>(getSize() + 2),
+                           reinterpret_cast<void*>(builtin_function->arg0()),
+                           AOTRelocKind::kBuiltinArg0, 8);
+      }
       mov(rdx, reinterpret_cast<uint64_t>(builtin_function->arg0()));
+
+      if (rec && rec->active()) {
+        rec->RecordHostPtr(static_cast<uint32_t>(getSize() + 2),
+                           reinterpret_cast<void*>(builtin_function->arg1()),
+                           AOTRelocKind::kBuiltinArg1, 8);
+      }
       mov(r8, reinterpret_cast<uint64_t>(builtin_function->arg1()));
+
       call(backend()->guest_to_host_thunk());
       // rax = host return
     }
@@ -821,6 +851,14 @@ void X64Emitter::CallExtern(const hir::Instr* instr, const Function* function) {
       // rdx = arg0
       // r8  = arg1
       // r9  = arg2
+
+      // AOT: record the extern handler pointer.
+      if (rec && rec->active()) {
+        rec->RecordHostPtr(
+            static_cast<uint32_t>(getSize() + 2),
+            reinterpret_cast<void*>(extern_function->extern_handler()),
+            AOTRelocKind::kNativeFunction, 8);
+      }
       mov(rcx, reinterpret_cast<uint64_t>(extern_function->extern_handler()));
       mov(rdx,
           qword[GetContextReg() + offsetof(ppc::PPCContext, kernel_state)]);
@@ -854,6 +892,15 @@ void X64Emitter::CallNativeSafe(void* fn) {
   // rdx = arg0
   // r8  = arg1
   // r9  = arg2
+
+  // AOT: record the host function pointer before it's baked as an immediate.
+  // mov rcx, imm64 encodes as REX.W B9 imm64; the imm64 starts 2 bytes in.
+  auto* rec = backend_ && backend_->aot_cache() ? backend_->aot_cache()->recorder() : nullptr;
+  if (rec && rec->active()) {
+    rec->RecordHostPtr(static_cast<uint32_t>(getSize() + 2), fn,
+                       AOTRelocKind::kNativeFunction, 8);
+  }
+
   mov(rcx, reinterpret_cast<uint64_t>(fn));
   call(backend()->guest_to_host_thunk());
   // rax = host return

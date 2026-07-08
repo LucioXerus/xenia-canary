@@ -85,6 +85,7 @@ DEFINE_bool(allow_game_relative_writes, false,
             "General");
 
 DECLARE_bool(allow_plugins);
+DECLARE_bool(aot_preload_on_launch);
 
 DEFINE_int32(priority_class, 0,
              "Forces Xenia to use different process priority than default one. "
@@ -1687,6 +1688,14 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
       if (!icon_block.empty()) {
         display_window_->SetIcon(icon_block.data(), icon_block.size());
       }
+    }
+  }
+
+  // AOT: preload cached native code if available.
+  if (processor_ && cvars::aot_preload_on_launch) {
+    auto* cpu_module = module->processor_module();
+    if (cpu_module && title_id_.has_value()) {
+      processor_->backend()->PreloadAOTCache(cpu_module, title_id_.value());
     }
   }
 

@@ -38,6 +38,7 @@ namespace x64 {
 using GuestProfilerData = std::map<uint32_t, uint64_t>;
 
 class X64CodeCache;
+class X64AOTCache;
 
 typedef void* (*HostToGuestThunk)(void* target, void* arg0, void* arg1);
 typedef void* (*GuestToHostThunk)(void* target, void* arg0, void* arg1);
@@ -137,6 +138,8 @@ class X64Backend : public Backend {
     return resolve_function_thunk_;
   }
 
+  X64AOTCache* aot_cache() const { return aot_cache_.get(); }
+
   void* synchronize_guest_and_host_stack_helper() const {
     return synchronize_guest_and_host_stack_helper_;
   }
@@ -181,6 +184,8 @@ class X64Backend : public Backend {
   virtual bool PopulatePseudoStacktrace(GuestPseudoStackTrace* st) override;
   void RecordMMIOExceptionForGuestInstruction(void* host_address);
 
+  size_t PreloadAOTCache(Module* module, uint32_t title_id) override;
+
   uint32_t LookupXMMConstantAddress32(unsigned index) {
     return static_cast<uint32_t>(emitter_data() + sizeof(vec128_t) * index);
   }
@@ -197,6 +202,7 @@ class X64Backend : public Backend {
   uintptr_t capstone_handle_ = 0;
 
   std::unique_ptr<X64CodeCache> code_cache_;
+  std::unique_ptr<X64AOTCache> aot_cache_;
   uintptr_t emitter_data_ = 0;
 
   HostToGuestThunk host_to_guest_thunk_;

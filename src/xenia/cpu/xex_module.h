@@ -281,6 +281,9 @@ class XexModule : public xe::cpu::Module {
   XexFormat xex_format_ = kFormatUnknown;
   SecurityInfoContext security_info_ = {};
 
+  const uint8_t* image_sha_bytes() const { return image_sha_bytes_; }
+  const std::string& image_sha_str() const { return image_sha_str_; }
+
   uint8_t image_sha_bytes_[20];
   std::string image_sha_str_;
   XexInfoCache info_cache_;

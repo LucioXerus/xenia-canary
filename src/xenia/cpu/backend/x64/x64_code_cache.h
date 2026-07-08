@@ -19,6 +19,8 @@ namespace cpu {
 namespace backend {
 namespace x64 {
 
+class X64Backend;
+
 class X64CodeCache : public CodeCacheBase<X64CodeCache> {
  public:
   ~X64CodeCache() override = default;
@@ -27,6 +29,8 @@ class X64CodeCache : public CodeCacheBase<X64CodeCache> {
 
   virtual bool Initialize();
 
+  void set_backend(X64Backend* backend) { backend_ = backend; }
+
   void* LookupUnwindInfo(uint64_t host_pc) override { return nullptr; }
 
   // CRTP hooks for CodeCacheBase.
@@ -34,6 +38,9 @@ class X64CodeCache : public CodeCacheBase<X64CodeCache> {
   void FlushCodeRange(void* address, size_t size);
   void OnCodePlaced(uint32_t guest_address, GuestFunction* function_info,
                     void* code_execute_address, size_t code_size);
+  void OnGuestCodePlacedForAOT(uint32_t guest_address, const void* machine_code,
+                               const EmitFunctionInfo& func_info,
+                               GuestFunction* function_info);
 
   // Virtual for platform-specific overrides (_win.cc / _posix.cc).
   virtual UnwindReservation RequestUnwindReservation(uint8_t* entry_address) {
@@ -46,6 +53,9 @@ class X64CodeCache : public CodeCacheBase<X64CodeCache> {
 
  protected:
   X64CodeCache() = default;
+
+ private:
+  X64Backend* backend_ = nullptr;
 };
 
 }  // namespace x64

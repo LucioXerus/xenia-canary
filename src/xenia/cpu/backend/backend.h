@@ -119,6 +119,10 @@ class Backend {
   }
   virtual void FreeGuestTrampoline(uint32_t trampoline_addr) {}
 
+  // Preload cached native code from the AOT cache.
+  // Returns the number of functions preloaded.
+  virtual size_t PreloadAOTCache(Module* module, uint32_t title_id) { return 0; }
+
  protected:
   Processor* processor_ = nullptr;
   MachineInfo machine_info_;
