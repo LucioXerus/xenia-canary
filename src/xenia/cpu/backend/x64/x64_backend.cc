@@ -16,8 +16,8 @@
 #include "xenia/base/exception_handler.h"
 #include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
-#include "xenia/cpu/backend/x64/x64_assembler.h"
 #include "xenia/cpu/backend/x64/x64_aot_cache.h"
+#include "xenia/cpu/backend/x64/x64_assembler.h"
 #include "xenia/cpu/backend/x64/x64_code_cache.h"
 #include "xenia/cpu/backend/x64/x64_emitter.h"
 #include "xenia/cpu/backend/x64/x64_function.h"
@@ -30,12 +30,18 @@
 
 DECLARE_bool(record_mmio_access_exceptions);
 
-DEFINE_bool(aot_cache, true, "Persist recompiled PPC->x64 code to disk and "
-            "reload it on subsequent launches.", "CPU");
-DEFINE_bool(aot_preload_on_launch, true, "Bulk-load the AOT cache with a "
-            "progress screen at title launch.", "CPU");
-DEFINE_string(aot_cache_path, "", "Override AOT cache directory (default: "
-              "<content_root>/aot_cache).", "CPU");
+DEFINE_bool(aot_cache, true,
+            "Persist recompiled PPC->x64 code to disk and "
+            "reload it on subsequent launches.",
+            "CPU");
+DEFINE_bool(aot_preload_on_launch, true,
+            "Bulk-load the AOT cache with a "
+            "progress screen at title launch.",
+            "CPU");
+DEFINE_string(aot_cache_path, "",
+              "Override AOT cache directory (default: "
+              "<content_root>/aot_cache).",
+              "CPU");
 
 DEFINE_int64(max_stackpoints, 65536,
              "Max number of host->guest stack mappings we can record.", "x64");
@@ -1880,12 +1886,40 @@ size_t X64Backend::PreloadAOTCache(Module* module, uint32_t title_id) {
   if (!aot_cache_ || !aot_cache_->enabled()) {
     return 0;
   }
+  // Register builtin/extern kernel-export handler symbols under stable keys
+  // BEFORE anything else. This runs at launch in every session (including the
+  // first, cache-miss run), so the recorder can key these host pointers during
+  // capture and ApplyRelocs can rebind them on reload.
+  aot_cache_->RegisterDynamicSymbols(processor());
   auto* xex = dynamic_cast<XexModule*>(module);
   if (!xex || !xex->image_sha_bytes()) {
     return 0;
   }
   return aot_cache_->PreloadModule(module, title_id, xex->image_sha_bytes(),
-                                    nullptr);
+                                   nullptr);
+}
+
+void X64Backend::FlushAOTCacheForModule(Module* module, uint32_t title_id) {
+  if (!aot_cache_ || !aot_cache_->enabled() || !module) {
+    return;
+  }
+  auto* xex = dynamic_cast<XexModule*>(module);
+  if (!xex || !xex->is_executable()) {
+    return;
+  }
+  const uint8_t* hash = xex->image_sha_bytes();
+  if (!hash) {
+    return;
+  }
+  aot_cache_->FlushModuleForTeardown(title_id, hash,
+                                     reinterpret_cast<uintptr_t>(xex));
+}
+
+void X64Backend::FlushAllPendingAOT() {
+  if (!aot_cache_) {
+    return;
+  }
+  aot_cache_->FlushAll();
 }
 
 }  // namespace x64

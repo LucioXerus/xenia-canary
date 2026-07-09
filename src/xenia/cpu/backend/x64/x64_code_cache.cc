@@ -22,7 +22,6 @@
 #endif
 
 #include "xenia/base/xxhash.h"
-#include "xenia/cpu/backend/x64/x64_aot_cache.h"
 #include "xenia/cpu/backend/x64/x64_backend.h"
 
 namespace xe {
@@ -63,36 +62,6 @@ void X64CodeCache::OnCodePlaced(uint32_t guest_address,
     iJIT_NotifyEvent(iJVM_EVENT_TYPE_METHOD_LOAD_FINISHED_V2, (void*)&method);
   }
 #endif
-}
-
-void X64CodeCache::OnGuestCodePlacedForAOT(uint32_t guest_address,
-                                            const void* machine_code,
-                                            const EmitFunctionInfo& func_info,
-                                            GuestFunction* function_info) {
-  auto* aot = backend_ ? backend_->aot_cache() : nullptr;
-  if (!aot || !aot->enabled() || !function_info) {
-    return;
-  }
-
-  auto* rec = aot->recorder();
-  if (!rec->active() || rec->failed()) {
-    return;
-  }
-
-  // Compute hash of guest PPC bytes for validation.
-  auto* memory = function_info->module()->memory();
-  const uint8_t* ppc_bytes = memory->TranslateVirtual<const uint8_t*>(
-      function_info->address());
-  uint32_t guest_size = function_info->has_end_address()
-                            ? function_info->end_address() - function_info->address()
-                            : 0;
-  uint64_t code_hash = 0;
-  if (ppc_bytes && guest_size > 0 && guest_size <= 65536) {
-    code_hash = XXH3_64bits(ppc_bytes, guest_size);
-  }
-
-  aot->OnFunctionCompiled(guest_address, machine_code, func_info, code_hash,
-                          reinterpret_cast<uintptr_t>(function_info->module()));
 }
 
 }  // namespace x64

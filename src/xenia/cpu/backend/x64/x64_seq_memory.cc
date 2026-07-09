@@ -431,6 +431,7 @@ struct RESERVED_LOAD_INT32
     // atomic op in the store
     e.prefetchw(e.ptr[e.rax]);
     e.mov(e.ecx, i.src1.reg().cvt32());
+    e.AotRecordHostCallRel32(e.backend()->try_acquire_reservation_helper_);
     e.call(e.backend()->try_acquire_reservation_helper_);
     e.mov(i.dest, e.dword[e.rax]);
 
@@ -451,6 +452,7 @@ struct RESERVED_LOAD_INT64
     // atomic op in the store
     e.prefetchw(e.ptr[e.rax]);
 
+    e.AotRecordHostCallRel32(e.backend()->try_acquire_reservation_helper_);
     e.call(e.backend()->try_acquire_reservation_helper_);
     e.mov(i.dest, e.qword[ComputeMemoryAddress(e, i.src1)]);
 
@@ -476,6 +478,7 @@ struct RESERVED_STORE_INT32
     e.mov(e.ecx, i.src1.reg().cvt32());
     e.lea(e.r9, e.ptr[ComputeMemoryAddress(e, i.src1)]);
     e.mov(e.r8d, i.src2);
+    e.AotRecordHostCallRel32(e.backend()->reserved_store_32_helper);
     e.call(e.backend()->reserved_store_32_helper);
     e.setz(i.dest);
   }
@@ -488,6 +491,7 @@ struct RESERVED_STORE_INT64
     e.mov(e.ecx, i.src1.reg().cvt32());
     e.lea(e.r9, e.ptr[ComputeMemoryAddress(e, i.src1)]);
     e.mov(e.r8, i.src2);
+    e.AotRecordHostCallRel32(e.backend()->reserved_store_64_helper);
     e.call(e.backend()->reserved_store_64_helper);
     e.setz(i.dest);
   }
@@ -1062,6 +1066,15 @@ struct LOAD_MMIO_I32
     auto read_address = uint32_t(i.src2.value);
     e.mov(e.GetNativeParam(0), uint64_t(mmio_range->callback_context));
     e.mov(e.GetNativeParam(1).cvt32(), read_address);
+    // AOT: mmio_range->read is an MMIO thunk (e.g. GraphicsSystem::
+    // ReadRegisterThunk / XmaDecoder::MMIOReadRegisterThunk) and
+    // callback_context is a host object pointer — both vary run-to-run and
+    // are not in the relocation symbol registry. Mark the function
+    // uncacheable so it is JIT'd fresh each run instead of reloaded with a
+    // stale relocated pointer (which produced a black screen on the 2nd run).
+    if (e.recorder().active()) {
+      e.recorder().Abort();
+    }
     e.CallNativeSafe(reinterpret_cast<void*>(mmio_range->read));
     e.bswap(e.eax);
     e.mov(i.dest, e.eax);
@@ -1092,6 +1105,11 @@ struct STORE_MMIO_I32
     } else {
       e.mov(e.GetNativeParam(2).cvt32(), i.src3);
       e.bswap(e.GetNativeParam(2).cvt32());
+    }
+    // AOT: mmio_range->write + callback_context are unregistered host ptrs
+    // (see LOAD_MMIO_I32 comment). Mark the function uncacheable.
+    if (e.recorder().active()) {
+      e.recorder().Abort();
     }
     e.CallNativeSafe(reinterpret_cast<void*>(mmio_range->write));
     if (IsTracingData()) {
@@ -1226,6 +1244,9 @@ struct LOAD_OFFSET_I32
         e.add(e.GetNativeParam(0).cvt32(), i.src2.reg().cvt32());
       }
 
+      if (e.recorder().active()) {
+        e.recorder().Abort();  // AOT: MMIO fn uncacheable
+      }
       e.CallNativeSafe(addrptr);
       e.mov(i.dest, e.eax);
     } else {
@@ -1253,6 +1274,9 @@ struct LOAD_OFFSET_I32
           mmio_fn = (void*)&MMIOAwareLoad<uint32_t, true>;
         }
         e.mov(e.GetNativeParam(0).cvt32(), e.eax);
+        if (e.recorder().active()) {
+          e.recorder().Abort();  // AOT: MMIO fn uncacheable
+        }
         e.CallNativeSafe(mmio_fn);
         e.mov(i.dest, e.eax);
         e.jmp(done, e.T_NEAR);
@@ -1367,6 +1391,9 @@ struct STORE_OFFSET_I32
       } else {
         e.mov(e.GetNativeParam(1).cvt32(), i.src3);
       }
+      if (e.recorder().active()) {
+        e.recorder().Abort();  // AOT: MMIO fn uncacheable
+      }
       e.CallNativeSafe(addrptr);
 
     } else {
@@ -1398,6 +1425,9 @@ struct STORE_OFFSET_I32
           e.mov(e.GetNativeParam(1).cvt32(), i.src3.constant());
         } else {
           e.mov(e.GetNativeParam(1).cvt32(), i.src3);
+        }
+        if (e.recorder().active()) {
+          e.recorder().Abort();  // AOT: MMIO fn uncacheable
         }
         e.CallNativeSafe(mmio_fn);
         e.jmp(done, e.T_NEAR);
@@ -1508,9 +1538,12 @@ struct LOAD_I32 : Sequence<LOAD_I32, I<OPCODE_LOAD, I32Op, I64Op>> {
       } else {
         e.mov(e.GetNativeParam(0).cvt32(), i.src1.reg().cvt32());
       }
-
+      if (e.recorder().active()) {
+        e.recorder().Abort();  // AOT: MMIO fn uncacheable
+      }
       e.CallNativeSafe(addrptr);
       e.mov(i.dest, e.eax);
+
     } else {
       Xbyak::Label normal_access, done;
       bool inline_mmio = cvars::emit_inline_mmio_checks && !IsTracingData();
@@ -1531,6 +1564,9 @@ struct LOAD_I32 : Sequence<LOAD_I32, I<OPCODE_LOAD, I32Op, I64Op>> {
           mmio_fn = (void*)&MMIOAwareLoad<uint32_t, true>;
         }
         e.mov(e.GetNativeParam(0).cvt32(), e.eax);
+        if (e.recorder().active()) {
+          e.recorder().Abort();  // AOT: MMIO fn uncacheable
+        }
         e.CallNativeSafe(mmio_fn);
         e.mov(i.dest, e.eax);
         e.jmp(done, e.T_NEAR);
@@ -1700,6 +1736,9 @@ struct STORE_I32 : Sequence<STORE_I32, I<OPCODE_STORE, VoidOp, I64Op, I32Op>> {
       } else {
         e.mov(e.GetNativeParam(1).cvt32(), i.src2);
       }
+      if (e.recorder().active()) {
+        e.recorder().Abort();  // AOT: MMIO fn uncacheable
+      }
       e.CallNativeSafe(addrptr);
 
     } else {
@@ -1726,6 +1765,9 @@ struct STORE_I32 : Sequence<STORE_I32, I<OPCODE_STORE, VoidOp, I64Op, I32Op>> {
           e.mov(e.GetNativeParam(1).cvt32(), i.src2.constant());
         } else {
           e.mov(e.GetNativeParam(1).cvt32(), i.src2);
+        }
+        if (e.recorder().active()) {
+          e.recorder().Abort();  // AOT: MMIO fn uncacheable
         }
         e.CallNativeSafe(mmio_fn);
         e.jmp(done, e.T_NEAR);

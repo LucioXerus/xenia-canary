@@ -180,6 +180,19 @@ Emulator::~Emulator() {
   audio_system_.reset();
   audio_media_player_.reset();
 
+  // AOT (C2): flush pending AOT entries to disk BEFORE the kernel_state
+  // (which owns the user module) and the processor (which owns the JIT
+  // buffers) are destroyed. This is the missing write path in the original
+  // implementation — without it, .xaot files are never produced and the
+  // second launch never sees anything. BufferedModule already carries the
+  // module_hash captured at JIT time, so FlushAllPendingAOT writes correctly-
+  // keyed .xaot files. Per-module flushes would need a live Module* which
+  // isn't trivially available here; FlushAllPendingAOT covers all pending
+  // entries.
+  if (processor_ && processor_->backend()) {
+    processor_->backend()->FlushAllPendingAOT();
+  }
+
   kernel_state_.reset();
   file_system_.reset();
 

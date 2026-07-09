@@ -24,8 +24,9 @@
 #include "xenia/base/memory.h"
 #include "xenia/base/profiling.h"
 #include "xenia/base/vec128.h"
-#include "xenia/cpu/backend/x64/x64_assembler.h"
+#include "xenia/base/xxhash.h"
 #include "xenia/cpu/backend/x64/x64_aot_cache.h"
+#include "xenia/cpu/backend/x64/x64_assembler.h"
 #include "xenia/cpu/backend/x64/x64_backend.h"
 #include "xenia/cpu/backend/x64/x64_code_cache.h"
 #include "xenia/cpu/backend/x64/x64_function.h"
@@ -106,6 +107,11 @@ X64Emitter::X64Emitter(X64Backend* backend, XbyakAllocator* allocator)
   may_use_membase32_as_zero_reg_ =
       static_cast<uint32_t>(reinterpret_cast<uintptr_t>(
           processor()->memory()->virtual_membase())) == 0;
+
+  // Wire AOT recorder to the backend's symbol registry (if AOT is enabled).
+  if (backend_->aot_cache()) {
+    recorder_.set_symbols(&backend_->aot_cache()->symbols());
+  }
 }
 
 X64Emitter::~X64Emitter() = default;
@@ -123,15 +129,21 @@ bool X64Emitter::Emit(GuestFunction* function, HIRBuilder* builder,
   trace_data_ = &function->trace_data();
   source_map_arena_.Reset();
 
-  // Begin AOT recording (captures host pointer relocations).
+  // Begin AOT recording (captures immersion host-pointer/rel32 sites during
+  // Emit). The recorder is per-emitter so concurrent compiles on different
+  // emitters don't race on a shared buffer.
   auto* aot = backend_ ? backend_->aot_cache() : nullptr;
   if (aot && aot->enabled()) {
-    aot->recorder()->Begin();
+    recorder_.Begin();
+  } else {
+    // Ensure the recorder is in an inactive (zero-cost) state if AOT is off.
+    recorder_.Reset();
   }
 
   // Fill the generator with code.
   EmitFunctionInfo func_info = {};
   if (!Emit(builder, func_info)) {
+    recorder_.Reset();
     return false;
   }
 
@@ -149,11 +161,9 @@ void* X64Emitter::Emplace(const EmitFunctionInfo& func_info,
   // To avoid changing xbyak, we do a switcharoo here.
   // top_ points to the Xbyak buffer, and since we are in AutoGrow mode
   // it has pending relocations. We copy the top_ to our buffer, swap the
-  // pointer, relocate, then return the original scratch pointer for use.
-  // top_ is used by Xbyak's ready() as both write base pointer and the absolute
-  // address base, which would not work on platforms not supporting writable
-  // executable memory, but Xenia doesn't use absolute label addresses in the
-  // generated code.
+  // pointer, then immediately run ready() to finalize jmp/call disps at the
+  // placed copy (NOT the scratch buffer). After ready() the bytes at
+  // new_write_address are the final executed bytes.
   uint8_t* old_address = top_;
   void* new_execute_address;
   void* new_write_address;
@@ -166,7 +176,9 @@ void* X64Emitter::Emplace(const EmitFunctionInfo& func_info,
                                new_write_address);
   }
   top_ = reinterpret_cast<uint8_t*>(new_write_address);
-  ready();
+  ready();  // Finalizes jmp/call disps at the placed copy. CRITICAL: this
+            // mutates the placed bytes, NOT the scratch buffer the AOT hook
+            // used to read pre-ready().
   top_ = old_address;
   reset();
   tail_code_.clear();
@@ -174,6 +186,34 @@ void* X64Emitter::Emplace(const EmitFunctionInfo& func_info,
     delete cached_label;
   }
   label_cache_.clear();
+
+  // C3 fix: capture AFTER ready() so the bytes are the final, fully patched,
+  // executed bytes. This is the only place we hand code to the AOT cache.
+  if (function) {
+    auto* aot_cache = backend_ ? backend_->aot_cache() : nullptr;
+    if (aot_cache && aot_cache->enabled() && guest_module_) {
+      // Compute the hash of the guest PPC bytes (for invalidation on load).
+      uint64_t code_hash = 0;
+      auto* memory = function->module()->memory();
+      const uint8_t* ppc_bytes =
+          memory->TranslateVirtual<const uint8_t*>(function->address());
+      uint32_t guest_size = function->has_end_address()
+                                ? function->end_address() - function->address()
+                                : 0;
+      if (ppc_bytes && guest_size > 0 && guest_size <= 65536) {
+        code_hash = XXH3_64bits(ppc_bytes, guest_size);
+      }
+      aot_cache->CaptureFunction(
+          function->address(), guest_size, new_execute_address, func_info,
+          code_hash, reinterpret_cast<uintptr_t>(function->module()),
+          /*title_id=*/0, guest_module_->image_sha_bytes(), &recorder_);
+    } else {
+      recorder_.Reset();
+    }
+  } else {
+    recorder_.Reset();
+  }
+
   return new_execute_address;
 }
 
@@ -695,7 +735,12 @@ void X64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
   auto fn = static_cast<X64Function*>(function);
   // Resolve address to the function to call and store in rax.
 
-  if (fn->machine_code()) {
+  // C4 fix: when AOT recording is active, skip the fn->machine_code() fast
+  // path. That path bakes a rel32 to another guest fn's host code, which is
+  // position-dependent and would require per-call-site reloc bookkeeping. We
+  // instead always route through the fixed 0x80000000 indirection table, which
+  // is position-independent.
+  if (fn->machine_code() && !recorder_.active()) {
     if (!(instr->flags & hir::CALL_TAIL)) {
       mov(rcx, qword[rsp + StackLayout::GUEST_CALL_RET_ADDR]);
 
@@ -724,6 +769,11 @@ void X64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
     // Old-style resolve.
     // Not too important because indirection table is almost always available.
     // TODO: Overwrite the call-site with a straight call.
+    // AOT: this path bakes ResolveFunction (an unregistered host ptr); rather
+    // than risk caching a stale pointer, mark the function non-cacheable.
+    if (recorder_.active()) {
+      recorder_.Abort();
+    }
     CallNative(&ResolveFunction, function->address());
   }
 
@@ -767,6 +817,11 @@ void X64Emitter::CallIndirect(const hir::Instr* instr,
   } else {
     // Old-style resolve.
     // Not too important because indirection table is almost always available.
+    // AOT: this path bakes ResolveFunction as an unrecorded imm64; mark the
+    // function non-cacheable so we never persist a stale host pointer.
+    if (recorder_.active()) {
+      recorder_.Abort();
+    }
     mov(edx, reg.cvt32());
     mov(rax, reinterpret_cast<uint64_t>(ResolveFunction));
     mov(rcx, GetContextReg());
@@ -807,7 +862,8 @@ uint64_t UndefinedCallExtern(void* raw_context, uint64_t function_ptr) {
 void X64Emitter::CallExtern(const hir::Instr* instr, const Function* function) {
   ForgetMxcsrMode();
 
-  auto* rec = backend_ && backend_->aot_cache() ? backend_->aot_cache()->recorder() : nullptr;
+  // The recorder is per-emitter; use it directly (not the backend's old
+  // shared recorder accessor, which has been removed).
   bool undefined = true;
   if (function->behavior() == Function::Behavior::kBuiltin) {
     auto builtin_function = static_cast<const BuiltinFunction*>(function);
@@ -818,28 +874,40 @@ void X64Emitter::CallExtern(const hir::Instr* instr, const Function* function) {
       // r8  = arg1
       // r9  = arg2
 
-      // AOT: record host pointers baked as immediates.
-      if (rec && rec->active()) {
-        rec->RecordHostPtr(static_cast<uint32_t>(getSize() + 2),
-                           reinterpret_cast<void*>(builtin_function->handler()),
-                           AOTRelocKind::kBuiltinHandler, 8);
-      }
+      // AOT: record host pointers baked as immediates (kAbs64HostPtr).
+      // Recorded AFTER the mov: RecordHostPtr derives the imm offset from
+      // the instruction end (robust to REX prefixes on r8-r15).
       mov(rcx, reinterpret_cast<uint64_t>(builtin_function->handler()));
-
-      if (rec && rec->active()) {
-        rec->RecordHostPtr(static_cast<uint32_t>(getSize() + 2),
-                           reinterpret_cast<void*>(builtin_function->arg0()),
-                           AOTRelocKind::kBuiltinArg0, 8);
+      if (recorder_.active()) {
+        recorder_.RecordHostPtr(
+            static_cast<uint32_t>(getSize()),
+            reinterpret_cast<void*>(builtin_function->handler()));
       }
+
       mov(rdx, reinterpret_cast<uint64_t>(builtin_function->arg0()));
-
-      if (rec && rec->active()) {
-        rec->RecordHostPtr(static_cast<uint32_t>(getSize() + 2),
-                           reinterpret_cast<void*>(builtin_function->arg1()),
-                           AOTRelocKind::kBuiltinArg1, 8);
+      if (recorder_.active()) {
+        recorder_.RecordHostPtr(
+            static_cast<uint32_t>(getSize()),
+            reinterpret_cast<void*>(builtin_function->arg0()));
       }
-      mov(r8, reinterpret_cast<uint64_t>(builtin_function->arg1()));
 
+      mov(r8, reinterpret_cast<uint64_t>(builtin_function->arg1()));
+      if (recorder_.active()) {
+        recorder_.RecordHostPtr(
+            static_cast<uint32_t>(getSize()),
+            reinterpret_cast<void*>(builtin_function->arg1()));
+      }
+
+      // C4 fix: the rel32 call site for guest_to_host_thunk is position-
+      // dependent (E8 disp = thunk - next_instr). Without relocation the
+      // cached code jumps to a stale thunk each run. Record it.
+      if (recorder_.active()) {
+        // Recorded BEFORE the call: the E8 opcode byte lands at getSize(), so
+        // the rel32 disp32 is at getSize()+1.
+        recorder_.RecordRel32HostCall(
+            static_cast<uint32_t>(getSize() + 1),
+            reinterpret_cast<void*>(backend()->guest_to_host_thunk()));
+      }
       call(backend()->guest_to_host_thunk());
       // rax = host return
     }
@@ -852,21 +920,47 @@ void X64Emitter::CallExtern(const hir::Instr* instr, const Function* function) {
       // r8  = arg1
       // r9  = arg2
 
-      // AOT: record the extern handler pointer.
-      if (rec && rec->active()) {
-        rec->RecordHostPtr(
-            static_cast<uint32_t>(getSize() + 2),
-            reinterpret_cast<void*>(extern_function->extern_handler()),
-            AOTRelocKind::kNativeFunction, 8);
+      if (recorder_.active()) {
+        // The extern handler is registered under a stable key (export
+        // name+ordinal) by X64AOTCache::RegisterDynamicSymbols at launch, so
+        // this RecordHostPtr resolves to that key and ApplyRelocs rebinds it
+        // to the current handler address on reload. If the handler was never
+        // registered (e.g. a late-generated trampoline) RecordHostPtr marks
+        // the function failed_ — the safe behavior (don't cache what we can't
+        // relocate).
+        // Recorded AFTER the mov (see CallExtern builtin path).
+        mov(rcx, reinterpret_cast<uint64_t>(extern_function->extern_handler()));
+        recorder_.RecordHostPtr(
+            static_cast<uint32_t>(getSize()),
+            reinterpret_cast<void*>(extern_function->extern_handler()));
+      } else {
+        mov(rcx, reinterpret_cast<uint64_t>(extern_function->extern_handler()));
       }
-      mov(rcx, reinterpret_cast<uint64_t>(extern_function->extern_handler()));
       mov(rdx,
           qword[GetContextReg() + offsetof(ppc::PPCContext, kernel_state)]);
+      if (recorder_.active()) {
+        recorder_.RecordRel32HostCall(
+            static_cast<uint32_t>(getSize() + 1),
+            reinterpret_cast<void*>(backend()->guest_to_host_thunk()));
+      }
       call(backend()->guest_to_host_thunk());
       // rax = host return
     }
+  } else {
+    // Unknown behavior: mark this function non-cacheable.
+    if (recorder_.active()) {
+      recorder_.Abort();
+    }
   }
   if (undefined) {
+    // CallNative routes through UndefinedCallExtern which is a host function
+    // ptr known at compile time of this site. CallNativeSafe has its own
+    // recording; here `function` is a dynamic runtime pointer (varies per
+    // invocation) so we must mark the function non-cacheable regardless of
+    // whether UndefinedCallExtern is a registered symbol.
+    if (recorder_.active()) {
+      recorder_.Abort();
+    }
     CallNative(UndefinedCallExtern, reinterpret_cast<uint64_t>(function));
   }
 }
@@ -893,15 +987,19 @@ void X64Emitter::CallNativeSafe(void* fn) {
   // r8  = arg1
   // r9  = arg2
 
-  // AOT: record the host function pointer before it's baked as an immediate.
-  // mov rcx, imm64 encodes as REX.W B9 imm64; the imm64 starts 2 bytes in.
-  auto* rec = backend_ && backend_->aot_cache() ? backend_->aot_cache()->recorder() : nullptr;
-  if (rec && rec->active()) {
-    rec->RecordHostPtr(static_cast<uint32_t>(getSize() + 2), fn,
-                       AOTRelocKind::kNativeFunction, 8);
-  }
-
+  // AOT: record the host function pointer after it's baked as an immediate.
+  // RecordHostPtr derives the imm offset from the instruction end (robust to
+  // the 5-byte/6-byte/10-byte mov-imm encoding variants).
   mov(rcx, reinterpret_cast<uint64_t>(fn));
+  if (recorder_.active()) {
+    recorder_.RecordHostPtr(static_cast<uint32_t>(getSize()), fn);
+  }
+  if (recorder_.active()) {
+    // C4 fix: the E8 disp32 starts right after the E8 opcode byte.
+    recorder_.RecordRel32HostCall(
+        static_cast<uint32_t>(getSize() + 1),
+        reinterpret_cast<void*>(backend()->guest_to_host_thunk()));
+  }
   call(backend()->guest_to_host_thunk());
   // rax = host return
 }
@@ -1853,31 +1951,62 @@ void X64Emitter::EnsureSynchronizedGuestAndHostStack() {
   // this condition
   test(esp, 15);
 
-  Xbyak::Label& sync_label = this->AddToTail(
-      [&return_from_sync](X64Emitter& e, Xbyak::Label& our_tail_label) {
-        e.L(our_tail_label);
+  Xbyak::Label& sync_label = this->AddToTail([&return_from_sync](
+                                                 X64Emitter& e,
+                                                 Xbyak::Label& our_tail_label) {
+    e.L(our_tail_label);
 
-        uint32_t stack32 = static_cast<uint32_t>(e.stack_size());
-        auto backend = e.backend();
-        if (stack32 < 256) {
-          e.call(backend->synchronize_guest_and_host_stack_helper_for_size(1));
-          e.db(stack32);
+    uint32_t stack32 = static_cast<uint32_t>(e.stack_size());
+    auto backend = e.backend();
+    if (stack32 < 256) {
+      // C4: record the rel32 call site (E8 disp32 at offset getSize()-4).
+      if (e.recorder().active()) {
+        e.recorder().RecordRel32HostCall(
+            static_cast<uint32_t>(e.getSize() + 1),
+            reinterpret_cast<void*>(
+                backend->synchronize_guest_and_host_stack_helper_for_size(1)));
+      }
+      e.call(backend->synchronize_guest_and_host_stack_helper_for_size(1));
+      e.db(stack32);
 
-        } else if (stack32 < 65536) {
-          e.call(backend->synchronize_guest_and_host_stack_helper_for_size(2));
-          e.dw(stack32);
-        } else {
-          // ought to be impossible, a host stack bigger than 65536??
-          e.call(backend->synchronize_guest_and_host_stack_helper_for_size(4));
-          e.dd(stack32);
-        }
-        e.jmp(return_from_sync, T_NEAR);
-      });
+    } else if (stack32 < 65536) {
+      if (e.recorder().active()) {
+        e.recorder().RecordRel32HostCall(
+            static_cast<uint32_t>(e.getSize() + 1),
+            reinterpret_cast<void*>(
+                backend->synchronize_guest_and_host_stack_helper_for_size(2)));
+      }
+      e.call(backend->synchronize_guest_and_host_stack_helper_for_size(2));
+      e.dw(stack32);
+    } else {
+      // ought to be impossible, a host stack bigger than 65536??
+      if (e.recorder().active()) {
+        e.recorder().RecordRel32HostCall(
+            static_cast<uint32_t>(e.getSize() + 1),
+            reinterpret_cast<void*>(
+                backend->synchronize_guest_and_host_stack_helper_for_size(4)));
+      }
+      e.call(backend->synchronize_guest_and_host_stack_helper_for_size(4));
+      e.dd(stack32);
+    }
+    e.jmp(return_from_sync, T_NEAR);
+  });
 
   jnz(sync_label, T_NEAR);
 
   L(return_from_sync);
 }
+
+void X64Emitter::AotRecordHostCallRel32(void* host_fn) {
+  // Call this IMMEDIATELY BEFORE emitting `call(host_fn)`. The E8 opcode byte
+  // will be written at the current getSize(), so the rel32 disp32 lands at
+  // getSize()+1 (opcode is 1 byte). ApplyRelocs recomputes that disp on load.
+  if (!recorder_.active()) {
+    return;
+  }
+  recorder_.RecordRel32HostCall(static_cast<uint32_t>(getSize() + 1), host_fn);
+}
+
 }  // namespace x64
 }  // namespace backend
 }  // namespace cpu

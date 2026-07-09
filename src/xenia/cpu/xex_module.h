@@ -232,6 +232,12 @@ class XexModule : public xe::cpu::Module {
 
   InfoCacheFlags* GetInstructionAddressFlags(uint32_t guest_addr);
 
+  // Module image SHA-1 bytes (populated by Precompile(); 20 bytes).
+  // Public so the AOT cache can key entries by the executable module hash
+  // cross-TU (e.g. x64_backend.cc::PreloadAOTCache).
+  const uint8_t* image_sha_bytes() const { return image_sha_bytes_; }
+  const std::string& image_sha_str() const { return image_sha_str_; }
+
   virtual void Precompile() override;
 
  protected:
@@ -280,9 +286,6 @@ class XexModule : public xe::cpu::Module {
 
   XexFormat xex_format_ = kFormatUnknown;
   SecurityInfoContext security_info_ = {};
-
-  const uint8_t* image_sha_bytes() const { return image_sha_bytes_; }
-  const std::string& image_sha_str() const { return image_sha_str_; }
 
   uint8_t image_sha_bytes_[20];
   std::string image_sha_str_;

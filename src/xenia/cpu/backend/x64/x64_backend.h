@@ -185,6 +185,12 @@ class X64Backend : public Backend {
   void RecordMMIOExceptionForGuestInstruction(void* host_address);
 
   size_t PreloadAOTCache(Module* module, uint32_t title_id) override;
+  // Flushes pending AOT data for a single module to disk. Call this for each
+  // still-alive executable module from the Emulator's title-teardown path,
+  // BEFORE ~Processor drops its modules_ list. Falls back to FlushAll() for
+  // any leftover entries that didn't match a known module.
+  void FlushAOTCacheForModule(Module* module, uint32_t title_id) override;
+  void FlushAllPendingAOT() override;
 
   uint32_t LookupXMMConstantAddress32(unsigned index) {
     return static_cast<uint32_t>(emitter_data() + sizeof(vec128_t) * index);

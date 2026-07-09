@@ -2284,6 +2284,12 @@ struct EXTRACT_I32
       e.mov(e.al, i.src2);
       e.and_(e.al, 0x03);
       e.shl(e.al, 4);
+      // AOT: extract_table_32 is a static local in this TU; follow-up scope
+      // registers it as a stable key. For now mark uncacheable so we never
+      // persist a function with an ASLR'd, non-relocatable pointer.
+      if (e.recorder().active()) {
+        e.recorder().Abort();
+      }
       e.mov(e.rdx, reinterpret_cast<uint64_t>(extract_table_32));
       e.vmovaps(e.xmm0, e.ptr[e.rdx + e.rax]);
       e.vpshufb(e.xmm0, src1, e.xmm0);

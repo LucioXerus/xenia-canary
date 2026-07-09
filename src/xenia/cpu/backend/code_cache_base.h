@@ -210,10 +210,6 @@ class CodeCacheBase : public CodeCache {
     self().OnCodePlaced(guest_address, function_info, code_execute_address,
                         func_info.code_size.total);
 
-    // AOT: persist this freshly compiled function.
-    self().OnGuestCodePlacedForAOT(guest_address, machine_code, func_info,
-                                   function_info);
-
     // Fix up indirection table.
     if (guest_address && indirection_table_base_) {
       uint32_t* indirection_slot = reinterpret_cast<uint32_t*>(
@@ -358,11 +354,6 @@ class CodeCacheBase : public CodeCache {
   // Default no-op for the OnCodePlaced hook.
   void OnCodePlaced(uint32_t guest_address, GuestFunction* function_info,
                     void* code_execute_address, size_t code_size) {}
-
-  // Default no-op for AOT hook.
-  void OnGuestCodePlacedForAOT(uint32_t guest_address, const void* machine_code,
-                               const EmitFunctionInfo& func_info,
-                               GuestFunction* function_info) {}
 
   std::filesystem::path file_name_;
   xe::memory::FileMappingHandle mapping_ =

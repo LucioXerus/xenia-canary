@@ -1,4 +1,4 @@
-﻿/**
+/**
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
  ******************************************************************************
@@ -84,6 +84,12 @@ struct COMMENT : Sequence<COMMENT, I<OPCODE_COMMENT, VoidOp, OffsetOp>> {
       // TODO(benvanik): don't just leak this memory.
       auto str_copy = strdup(str);
       e.mov(e.rdx, reinterpret_cast<uint64_t>(str_copy));
+      // AOT: tracing path bakes a heap-allocated pointer + an unregistered
+      // TraceString symbol. Mark the function non-cacheable (a follow-up to
+      // register TraceString as a stable key is scope-cut).
+      if (e.recorder().active()) {
+        e.recorder().Abort();
+      }
       e.CallNative(reinterpret_cast<void*>(TraceString));
     }
   }
@@ -2179,6 +2185,7 @@ struct RSQRT_F64 : Sequence<RSQRT_F64, I<OPCODE_RSQRT, F64Op, F64Op>> {
     e.ChangeMxcsrMode(MXCSRMode::Fpu);
     Xmm src1 = GetInputRegOrConstant(e, i.src1, e.xmm3);
     e.vmovsd(e.xmm0, src1);
+    e.AotRecordHostCallRel32(e.backend()->frsqrtefp_helper);
     e.call(e.backend()->frsqrtefp_helper);
     e.vmovsd(i.dest, e.xmm0);
   }
@@ -2194,10 +2201,12 @@ struct RSQRT_V128 : Sequence<RSQRT_V128, I<OPCODE_RSQRT, V128Op, V128Op>> {
     */
     if (i.src1.value && i.src1.value->AllFloatVectorLanesSameValue()) {
       e.vmovss(e.xmm0, src1);
+      e.AotRecordHostCallRel32(e.backend()->vrsqrtefp_scalar_helper);
       e.call(e.backend()->vrsqrtefp_scalar_helper);
       e.vshufps(i.dest, e.xmm0, e.xmm0, 0);
     } else {
       e.vmovaps(e.xmm0, src1);
+      e.AotRecordHostCallRel32(e.backend()->vrsqrtefp_vector_helper);
       e.call(e.backend()->vrsqrtefp_vector_helper);
       e.vmovaps(i.dest, e.xmm0);
     }
