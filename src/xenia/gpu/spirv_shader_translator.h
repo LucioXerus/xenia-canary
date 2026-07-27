@@ -34,7 +34,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // TODO(Triang3l): Change to 0xYYYYMMDD once it's out of the rapid
     // prototyping stage (easier to do small granular updates with an
     // incremental counter).
-    static constexpr uint32_t kVersion = 8;
+    static constexpr uint32_t kVersion = 10;
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,
@@ -89,6 +89,11 @@ class SpirvShaderTranslator : public ShaderTranslator {
       // pre-multiply. Only RT0 is supported for now.
       xenos::BlendFactor rt0_blend_rgb_factor_for_premult : 5;
       xenos::BlendFactor rt0_blend_a_factor_for_premult : 5;
+      // PsParamGen and the memexport dedup must act like there's no resolution
+      // scaling. Doesn't affect fetch offsets, those follow texture scale, not
+      // from the draw. This is only set when the draw is native because of a
+      // set scale threshold (FBO only).
+      uint32_t resolution_scale_native : 1;
     } pixel;
     uint64_t value = 0;
 
@@ -275,6 +280,13 @@ class SpirvShaderTranslator : public ShaderTranslator {
 
     // The constant blend factor for the respective modes.
     float edram_blend_constant[4];
+
+    // Integer num_format on fixed textures. Each dword packs the scale needed
+    // to turn normalized host samples back into guest integer values.
+    // bits 0:3 = component_bits - 1
+    // bit 4 = signed.
+    // Zero means no scale.
+    uint32_t texture_integer_scale_bits[32];
   };
 
   // Separate constant buffer for user clip planes
@@ -462,6 +474,16 @@ class SpirvShaderTranslator : public ShaderTranslator {
                                uint32_t f24_shift, bool remap_to_0_to_0_5,
                                bool result_as_uint,
                                spv::Id ext_inst_glsl_std_450);
+
+  // Piecewise-linear gamma conversions for k_8_8_8_8_GAMMA values stored as
+  // linear UNORM16. Values may be scalars or vectors of up to 3 components.
+  // Unless pre_saturated is true, inputs are clamped to [0, 1] (NaN to 0).
+  static spv::Id PWLGammaToLinear(SpirvBuilder* builder_, spv::Id value,
+                                  bool pre_saturated,
+                                  spv::Id ext_inst_glsl_std_450);
+  static spv::Id LinearToPWLGamma(SpirvBuilder* builder_, spv::Id value,
+                                  bool pre_saturated,
+                                  spv::Id ext_inst_glsl_std_450);
 
  protected:
   void Reset() override;
@@ -681,10 +703,6 @@ class SpirvShaderTranslator : public ShaderTranslator {
 
   void ExportToMemory(uint8_t export_eM);
 
-  // The source may be a floating-point scalar or a vector.
-  spv::Id PWLGammaToLinear(spv::Id gamma, bool gamma_pre_saturated);
-  spv::Id LinearToPWLGamma(spv::Id linear, bool linear_pre_saturated);
-
   size_t FindOrAddTextureBinding(uint32_t fetch_constant,
                                  xenos::FetchOpDimension dimension,
                                  bool is_signed);
@@ -780,6 +798,21 @@ class SpirvShaderTranslator : public ShaderTranslator {
   bool native_2x_msaa_no_attachments_;
   uint32_t draw_resolution_scale_x_;
   uint32_t draw_resolution_scale_y_;
+
+  // Scale of the draw being translated. All position-dependent paths use
+  // these. Only fetch offset scaling uses draw_resolution_scale_x_/y_ directly.
+  uint32_t GetCurrentDrawResolutionScaleX() const {
+    return is_pixel_shader() &&
+                   GetSpirvShaderModification().pixel.resolution_scale_native
+               ? 1
+               : draw_resolution_scale_x_;
+  }
+  uint32_t GetCurrentDrawResolutionScaleY() const {
+    return is_pixel_shader() &&
+                   GetSpirvShaderModification().pixel.resolution_scale_native
+               ? 1
+               : draw_resolution_scale_y_;
+  }
 
   // For safety with different drivers (even though fragment shader interlock in
   // SPIR-V only has one control flow requirement - that both begin and end must
@@ -905,6 +938,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kSystemConstantEdramRTKeepMask,
     kSystemConstantEdramRTClamp,
     kSystemConstantEdramBlendConstant,
+    kSystemConstantTextureIntegerScaleBits,
   };
   spv::Id uniform_system_constants_;
   spv::Id uniform_clip_plane_constants_;

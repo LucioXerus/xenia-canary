@@ -145,6 +145,27 @@ class D3D12TextureCache final : public TextureCache {
     assert_true(IsDrawResolutionScaled());
     GetCurrentScaledResolveBuffer().SetUAVBarrierPending();
   }
+  // The range specified in the last successful MakeScaledResolveRangeCurrent
+  // call, in the scaled physical memory address space.
+  uint64_t GetCurrentScaledResolveRangeStartScaled() const {
+    assert_true(IsDrawResolutionScaled());
+    return scaled_resolve_current_range_start_scaled_;
+  }
+  uint64_t GetCurrentScaledResolveRangeLengthScaled() const {
+    assert_true(IsDrawResolutionScaled());
+    return scaled_resolve_current_range_length_scaled_;
+  }
+  // The resource of the buffer containing the current scaled resolve range,
+  // and the offset of the start of the buffer within the scaled physical
+  // memory address space (the buffer index is also its gigabyte offset).
+  ID3D12Resource* GetCurrentScaledResolveBufferResource() {
+    assert_true(IsDrawResolutionScaled());
+    return GetCurrentScaledResolveBuffer().resource();
+  }
+  uint64_t GetCurrentScaledResolveBufferBaseOffset() const {
+    assert_true(IsDrawResolutionScaled());
+    return uint64_t(GetCurrentScaledResolveBufferIndex()) << 30;
+  }
 
   // Returns the ID3D12Resource of the front buffer texture (in
   // NON_PIXEL_SHADER_RESOURCE state), or nullptr in case of failure, and writes
@@ -172,10 +193,10 @@ class D3D12TextureCache final : public TextureCache {
     LoadShaderIndex load_shader_signed;
 
     // Do NOT add integer DXGI formats to this - they are not filterable, can
-    // only be read with Load, not Sample! If any game is seen using num_format
-    // 1 for fixed-point formats (for floating-point, it's normally set to 1
-    // though), add a constant buffer containing multipliers for the
-    // textures and multiplication to the tfetch implementation.
+    // only be read with Load, not Sample! Games that fetch fixed-point formats
+    // are handled after sampling by scaling the normalized host value back to
+    // the guest integer range (see GetIntegerScaleBits). Keep these as
+    // sampled float/normalized views.
 
     // Whether the DXGI format, if not uncompressing the texture, consists of
     // blocks, thus copy regions must be aligned to block size (assuming it's
