@@ -172,7 +172,7 @@ class D3D12CommandProcessor final : public CommandProcessor {
     kEdramR32UintUAV,
     kEdramR32G32UintUAV,
     kEdramR32G32B32A32UintUAV,
-    kZpdROVCounterRawUAV,
+    kZpdCounterRawUAV,
 
     kGammaRampTableSRV,
     kGammaRampPWLSRV,
@@ -452,26 +452,28 @@ class D3D12CommandProcessor final : public CommandProcessor {
       D3D12_CPU_DESCRIPTOR_HANDLE& cpu_handle_out,
       D3D12_GPU_DESCRIPTOR_HANDLE& gpu_handle_out);
 
-  void UpdateFixedFunctionState(const draw_util::ViewportInfo& viewport_info,
-                                const draw_util::Scissor& scissor,
-                                bool primitive_polygonal,
-                                reg::RB_DEPTHCONTROL normalized_depth_control);
+  void UpdateFixedFunctionState(
+      const draw_util::ViewportInfo& viewport_info,
+      const draw_util::Scissor& scissor, bool primitive_polygonal,
+      reg::RB_DEPTHCONTROL normalized_depth_control,
+      uint32_t normalized_color_mask,
+      uint32_t bound_depth_and_color_render_target_bits);
 
   template <bool primitive_polygonal, bool edram_rov_used>
   XE_NOINLINE void UpdateSystemConstantValues_Impl(
       bool shared_memory_is_uav, uint32_t line_loop_closing_index,
       xenos::Endian index_endian, const draw_util::ViewportInfo& viewport_info,
       uint32_t used_texture_mask, reg::RB_DEPTHCONTROL normalized_depth_control,
-      uint32_t normalized_color_mask);
+      uint32_t normalized_color_mask,
+      const draw_util::HostDepthPolygonOffset* host_depth_polygon_offset);
 
-  void UpdateSystemConstantValues(bool shared_memory_is_uav,
-                                  bool primitive_polygonal,
-                                  uint32_t line_loop_closing_index,
-                                  xenos::Endian index_endian,
-                                  const draw_util::ViewportInfo& viewport_info,
-                                  uint32_t used_texture_mask,
-                                  reg::RB_DEPTHCONTROL normalized_depth_control,
-                                  uint32_t normalized_color_mask);
+  void UpdateSystemConstantValues(
+      bool shared_memory_is_uav, bool primitive_polygonal,
+      uint32_t line_loop_closing_index, xenos::Endian index_endian,
+      const draw_util::ViewportInfo& viewport_info, uint32_t used_texture_mask,
+      reg::RB_DEPTHCONTROL normalized_depth_control,
+      uint32_t normalized_color_mask,
+      const draw_util::HostDepthPolygonOffset* host_depth_polygon_offset);
   bool UpdateBindings(const D3D12Shader* vertex_shader,
                       const D3D12Shader* pixel_shader,
                       ID3D12RootSignature* root_signature,
@@ -494,23 +496,22 @@ class D3D12CommandProcessor final : public CommandProcessor {
   ID3D12Resource* RequestReadbackBuffer(uint32_t size);
 
   void WriteGammaRampSRV(bool is_pwl, D3D12_CPU_DESCRIPTOR_HANDLE handle) const;
-  void WriteZPDROVCounterRawUAVDescriptor(
+  void WriteZPDCounterRawUAVDescriptor(
       D3D12_CPU_DESCRIPTOR_HANDLE handle) const;
 
   // ZPD occlusion queries backend.
   // BeginQuery/EndQuery must be in the same command list, segments split at
-  // EndSubmission, resume at BeginSubmission. Discarded queries still need
-  // EndQuery or the heap slot breaks on some drivers. RecordZPDResolveBatch
-  // emits coalesced ResolveQueryData and ROV counter copies at submit.
+  // EndSubmission, resume at BeginSubmission. RecordZPDResolveBatch emits
+  // coalesced ResolveQueryData and counter copies at submit.
   void EnsureZPDQueryResources() override;
   void ShutdownZPDQueryResources() override {
     zpd_resolves_in_flight_.clear();
     zpd_active_query_index_ = UINT32_MAX;
     zpd_active_query_generation_ = 0;
     zpd_active_query_is_rov_ = false;
-    zpd_query_pool_needs_rov_counter_ = false;
-    bindful_zpd_rov_counter_buffer_ = nullptr;
-    bindful_zpd_rov_counter_capacity_ = 0;
+    zpd_rov_path_ = false;
+    bindful_zpd_counter_buffer_ = nullptr;
+    bindful_zpd_counter_capacity_ = 0;
     if (!bindless_resources_used_) {
       draw_view_bindful_heap_index_ =
           ui::d3d12::D3D12DescriptorHeapPool::kHeapIndexInvalid;
@@ -523,11 +524,9 @@ class D3D12CommandProcessor final : public CommandProcessor {
   bool IsZPDQueryPoolReady() const override;
   bool CanOpenZPDQuery() const override;
 
-  QueryOpenResult OpenZPDQuery(ReportHandle report_handle,
-                               bool can_close_submission) override;
+  QueryOpenResult OpenZPDQuery(bool can_close_submission) override;
   bool CloseZPDQuery(ReportHandle report_handle,
                      uint64_t& out_submission) override;
-  bool DiscardZPDQuery() override;
   void PumpQueryResolves() override;
   bool AwaitQueryResolve(ReportHandle report_handle,
                          uint64_t wait_for_submission) override;
@@ -543,13 +542,15 @@ class D3D12CommandProcessor final : public CommandProcessor {
     uint32_t query_index = UINT32_MAX;
     uint32_t query_generation = 0;
     uint32_t scale_area = 1;
-    bool uses_rov_counter = false;
+    bool rov = false;
+    bool hybrid = false;
     ReportHandle report_handle = kInvalidReportHandle;
   };
   uint32_t zpd_active_query_index_ = UINT32_MAX;
   uint32_t zpd_active_query_generation_ = 0;
   bool zpd_active_query_is_rov_ = false;
-  bool zpd_query_pool_needs_rov_counter_ = false;
+  bool zpd_rov_path_ = false;
+  bool zpd_hybrid_supported_ = false;
   std::deque<PendingQueryResolve> zpd_resolves_in_flight_;
 
   std::unique_ptr<ui::d3d12::D3D12GPUCompletionTimeline> completion_timeline_;
@@ -596,8 +597,8 @@ class D3D12CommandProcessor final : public CommandProcessor {
   std::unique_ptr<D3D12RenderTargetCache> render_target_cache_;
 
   std::unique_ptr<D3D12ZPDQueryPool> zpd_host_query_pool_;
-  ID3D12Resource* bindful_zpd_rov_counter_buffer_ = nullptr;
-  uint32_t bindful_zpd_rov_counter_capacity_ = 0;
+  ID3D12Resource* bindful_zpd_counter_buffer_ = nullptr;
+  uint32_t bindful_zpd_counter_capacity_ = 0;
 
   std::unique_ptr<ui::d3d12::D3D12UploadBufferPool> constant_buffer_pool_;
 

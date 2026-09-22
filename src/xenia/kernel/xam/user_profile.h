@@ -102,6 +102,11 @@ class UserProfile {
   UserProfile(const uint64_t xuid, const X_XAMACCOUNTINFO* account_info);
 
   uint64_t xuid() const { return xuid_; }
+  uint64_t GetOnlineXUID() const {
+    return IsLiveEnabled() ? static_cast<uint64_t>(account_info_.xuid_online)
+                           : 0;
+  }
+
   std::string name() const { return account_info_.GetGamertagString(); }
   uint32_t signin_state() const {
     return static_cast<uint32_t>(SignInState::SignedInLocally);
@@ -139,7 +144,7 @@ class UserProfile {
       icon_type = XTileType::kGamerTileSmall;
     }
 
-    if (profile_images_.find(icon_type) == profile_images_.cend()) {
+    if (!profile_images_.contains(icon_type)) {
       return {};
     }
 
@@ -174,6 +179,7 @@ class UserProfile {
                         std::span<const uint8_t> icon_data);
   std::vector<uint8_t> LoadGpd(const uint32_t title_id);
   bool WriteGpd(const uint32_t title_id);
+  bool RemoveGpd(const uint32_t title_id);
 };
 
 }  // namespace xam

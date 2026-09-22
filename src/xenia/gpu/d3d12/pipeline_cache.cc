@@ -83,11 +83,13 @@ namespace shaders {
 PipelineCache::PipelineCache(D3D12CommandProcessor& command_processor,
                              const RegisterFile& register_file,
                              const D3D12RenderTargetCache& render_target_cache,
-                             bool bindless_resources_used)
+                             bool bindless_resources_used,
+                             bool zpd_hybrid_supported)
     : command_processor_(command_processor),
       register_file_(register_file),
       render_target_cache_(render_target_cache),
-      bindless_resources_used_(bindless_resources_used) {
+      bindless_resources_used_(bindless_resources_used),
+      zpd_hybrid_supported_(zpd_hybrid_supported) {
   const ui::d3d12::D3D12Provider& provider =
       command_processor_.GetD3D12Provider();
 
@@ -103,9 +105,21 @@ PipelineCache::PipelineCache(D3D12CommandProcessor& command_processor,
       render_target_cache_.draw_resolution_scale_y(),
       provider.GetGraphicsAnalysis() != nullptr);
 
-  if (edram_rov_used) {
-    depth_only_pixel_shader_ =
-        std::move(shader_translator_->CreateDepthOnlyPixelShader());
+  depth_only_pixel_shader_ =
+      std::move(shader_translator_->CreateDepthOnlyPixelShader());
+  if (!edram_rov_used && zpd_hybrid_supported_) {
+    using DepthStencilMode =
+        DxbcShaderTranslator::Modification::DepthStencilMode;
+    zpd_total_depth_only_pixel_shader_ =
+        std::move(shader_translator_->CreateDepthOnlyPixelShader(true));
+    if (render_target_cache_.depth_float24_convert_in_pixel_shader()) {
+      zpd_total_float24_truncate_pixel_shader_ =
+          std::move(shader_translator_->CreateDepthOnlyPixelShader(
+              true, DepthStencilMode::kFloat24Truncating));
+      zpd_total_float24_round_pixel_shader_ =
+          std::move(shader_translator_->CreateDepthOnlyPixelShader(
+              true, DepthStencilMode::kFloat24Rounding));
+    }
   }
 }
 
@@ -235,8 +249,11 @@ void PipelineCache::InitializeShaderStorage(
 
   ShaderStorageWriter<PipelineStoredDescription>::PipelineStorageConfig
       pipeline_config;
-  pipeline_config.file_suffix =
-      fmt::format(".{}.d3d12.xpso", edram_rov_used ? "rov" : "rtv");
+  // Full ZPD counters change every ROV pixel shader, so they get their own
+  // storage.
+  pipeline_config.file_suffix = fmt::format(
+      ".{}{}.d3d12.xpso", edram_rov_used ? "rov" : "rtv",
+      edram_rov_used && cvars::occlusion_query_full_counters ? "-fc" : "");
   pipeline_config.api_magic = edram_rov_used ? 0x4F525844 : 0x54525844;
   pipeline_config.version =
       std::max(PipelineDescription::kVersion,
@@ -650,7 +667,8 @@ PipelineCache::GetCurrentVertexShaderModification(
 DxbcShaderTranslator::Modification
 PipelineCache::GetCurrentPixelShaderModification(
     const Shader& shader, uint32_t interpolator_mask, uint32_t param_gen_pos,
-    reg::RB_DEPTHCONTROL normalized_depth_control) const {
+    reg::RB_DEPTHCONTROL normalized_depth_control,
+    bool apply_polygon_offset_in_shader) const {
   assert_true(shader.type() == xenos::ShaderType::kPixel);
   assert_true(shader.is_ucode_analyzed());
   const auto& regs = register_file_;
@@ -693,14 +711,21 @@ PipelineCache::GetCurrentPixelShaderModification(
         regs.Get<reg::RB_DEPTH_INFO>().depth_format ==
             xenos::DepthRenderTargetFormat::kD24FS8) {
       modification.pixel.depth_stencil_mode =
-          render_target_cache_.depth_float24_round()
-              ? DepthStencilMode::kFloat24Rounding
-              : DepthStencilMode::kFloat24Truncating;
+          apply_polygon_offset_in_shader
+              ? (render_target_cache_.depth_float24_round()
+                     ? DepthStencilMode::kFloat24RoundingPolygonOffset
+                     : DepthStencilMode::kFloat24TruncatingPolygonOffset)
+              : (render_target_cache_.depth_float24_round()
+                     ? DepthStencilMode::kFloat24Rounding
+                     : DepthStencilMode::kFloat24Truncating);
     } else {
-      if (shader.implicit_early_z_write_allowed() &&
-          (!shader.writes_color_target(0) ||
-           !draw_util::DoesCoverageDependOnAlpha(
-               regs.Get<reg::RB_COLORCONTROL>()))) {
+      if (apply_polygon_offset_in_shader) {
+        modification.pixel.depth_stencil_mode =
+            DepthStencilMode::kPolygonOffset;
+      } else if (shader.implicit_early_z_write_allowed() &&
+                 (!shader.writes_color_target(0) ||
+                  !draw_util::DoesCoverageDependOnAlpha(
+                      regs.Get<reg::RB_COLORCONTROL>()))) {
         modification.pixel.depth_stencil_mode = DepthStencilMode::kEarlyHint;
       } else {
         modification.pixel.depth_stencil_mode = DepthStencilMode::kNoModifiers;
@@ -748,8 +773,8 @@ bool PipelineCache::ConfigurePipeline(
     D3D12Shader::D3D12Translation* pixel_shader,
     const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
     reg::RB_DEPTHCONTROL normalized_depth_control,
-    uint32_t normalized_color_mask,
-    uint32_t bound_depth_and_color_render_target_bits,
+    uint32_t normalized_color_mask, bool apply_polygon_offset_in_shader,
+    bool zpd_total, uint32_t bound_depth_and_color_render_target_bits,
     const uint32_t* bound_depth_and_color_render_target_formats,
     void** pipeline_handle_out, ID3D12RootSignature** root_signature_out) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -830,6 +855,7 @@ bool PipelineCache::ConfigurePipeline(
   if (!GetCurrentStateDescription(
           vertex_shader, pixel_shader, primitive_processing_result,
           normalized_depth_control, normalized_color_mask,
+          apply_polygon_offset_in_shader, zpd_total,
           bound_depth_and_color_render_target_bits,
           bound_depth_and_color_render_target_formats, runtime_description,
           use_async)) {
@@ -1230,8 +1256,8 @@ bool PipelineCache::GetCurrentStateDescription(
     D3D12Shader::D3D12Translation* pixel_shader,
     const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
     reg::RB_DEPTHCONTROL normalized_depth_control,
-    uint32_t normalized_color_mask,
-    uint32_t bound_depth_and_color_render_target_bits,
+    uint32_t normalized_color_mask, bool depth_bias_in_pixel_shader,
+    bool zpd_total, uint32_t bound_depth_and_color_render_target_bits,
     const uint32_t* bound_depth_and_color_render_target_formats,
     PipelineRuntimeDescription& runtime_description_out, bool for_placeholder) {
   // Translated shaders needed at least for the root signature.
@@ -1424,7 +1450,7 @@ bool PipelineCache::GetCurrentStateDescription(
     cull_front = false;
     cull_back = false;
   }
-  if (!edram_rov_used) {
+  if (!edram_rov_used && !depth_bias_in_pixel_shader) {
     float polygon_offset, polygon_offset_scale;
     draw_util::GetPreferredFacePolygonOffset(
         regs, primitive_polygonal, polygon_offset_scale, polygon_offset);
@@ -1437,10 +1463,19 @@ bool PipelineCache::GetCurrentStateDescription(
     description_out.resolution_scale_native =
         uint32_t(render_target_cache_.IsDrawScaleNative());
   }
+  description_out.zpd_total = uint32_t(zpd_total);
   if (tessellated && cvars::d3d12_tessellation_wireframe) {
     description_out.fill_mode_wireframe = 1;
   }
-  description_out.depth_clip = !regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable;
+
+  // With force_depth_clamp, use the host viewport clamp instead of near and far
+  // Z plane clipping. X/Y/W clipping is unchanged. Both 494707EE and 41560881
+  // have passes that rely on alpha inputs that currently gets dropped by
+  // near-plane clipping.
+  // TODO(boma): Investigate whether the difference is in shader arithmetic or
+  // the clipper itself.
+  description_out.depth_clip = !regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable &&
+                               !cvars::force_depth_clamp;
   bool depth_stencil_bound_and_used = false;
   if (!edram_rov_used) {
     // Depth/stencil. No stencil, always passing depth test and no depth writing
@@ -1527,9 +1562,9 @@ bool PipelineCache::GetCurrentStateDescription(
         // ONE_MINUS_CONSTANT_COLOR
         /* 13 */ PipelineBlendFactor::kInvBlendFactor,
         // CONSTANT_ALPHA
-        /* 14 */ PipelineBlendFactor::kBlendFactor,
+        /* 14 */ PipelineBlendFactor::kAlphaFactor,
         // ONE_MINUS_CONSTANT_ALPHA
-        /* 15 */ PipelineBlendFactor::kInvBlendFactor,
+        /* 15 */ PipelineBlendFactor::kInvAlphaFactor,
         /* 16 */ PipelineBlendFactor::kSrcAlphaSat,
     };
     // Like kBlendFactorMap, but with color modes changed to alpha. Some
@@ -2989,6 +3024,22 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
         runtime_description.pixel_shader->translated_binary().data();
     state_desc.PS.BytecodeLength =
         runtime_description.pixel_shader->translated_binary().size();
+  } else if (description.zpd_total &&
+             !zpd_total_depth_only_pixel_shader_.empty()) {
+    // Native ZPD query without a guest pixel shader.
+    // Coverage still has to be counted.
+    const std::vector<uint8_t>* zpd_total_pixel_shader =
+        &zpd_total_depth_only_pixel_shader_;
+    if (render_target_cache_.depth_float24_convert_in_pixel_shader() &&
+        (description.depth_func != xenos::CompareFunction::kAlways ||
+         description.depth_write) &&
+        description.depth_format == xenos::DepthRenderTargetFormat::kD24FS8) {
+      zpd_total_pixel_shader = render_target_cache_.depth_float24_round()
+                                   ? &zpd_total_float24_round_pixel_shader_
+                                   : &zpd_total_float24_truncate_pixel_shader_;
+    }
+    state_desc.PS.pShaderBytecode = zpd_total_pixel_shader->data();
+    state_desc.PS.BytecodeLength = zpd_total_pixel_shader->size();
   } else if (edram_rov_used) {
     state_desc.PS.pShaderBytecode = depth_only_pixel_shader_.data();
     state_desc.PS.BytecodeLength = depth_only_pixel_shader_.size();
@@ -3004,6 +3055,12 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
         state_desc.PS.pShaderBytecode = shaders::float24_truncate_ps;
         state_desc.PS.BytecodeLength = sizeof(shaders::float24_truncate_ps);
       }
+    } else if (!description.depth_write && !description.stencil_write_mask) {
+      // Bind an empty PS to force rasterization.
+      // D3D drops PS-less draws without depth/stencil writes, breaking
+      // occlusion queries (4541096E, 5553083B).
+      state_desc.PS.pShaderBytecode = depth_only_pixel_shader_.data();
+      state_desc.PS.BytecodeLength = depth_only_pixel_shader_.size();
     }
   }
 
@@ -3139,14 +3196,26 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
 
     // Render targets and blending.
     state_desc.BlendState.IndependentBlendEnable = true;
-    static constexpr D3D12_BLEND kBlendFactorMap[] = {
-        D3D12_BLEND_ZERO,          D3D12_BLEND_ONE,
-        D3D12_BLEND_SRC_COLOR,     D3D12_BLEND_INV_SRC_COLOR,
-        D3D12_BLEND_SRC_ALPHA,     D3D12_BLEND_INV_SRC_ALPHA,
-        D3D12_BLEND_DEST_COLOR,    D3D12_BLEND_INV_DEST_COLOR,
-        D3D12_BLEND_DEST_ALPHA,    D3D12_BLEND_INV_DEST_ALPHA,
-        D3D12_BLEND_BLEND_FACTOR,  D3D12_BLEND_INV_BLEND_FACTOR,
+    const bool alpha_blend_factor_supported =
+        command_processor_.GetD3D12Provider().IsAlphaBlendFactorSupported();
+    const D3D12_BLEND kBlendFactorMap[] = {
+        D3D12_BLEND_ZERO,
+        D3D12_BLEND_ONE,
+        D3D12_BLEND_SRC_COLOR,
+        D3D12_BLEND_INV_SRC_COLOR,
+        D3D12_BLEND_SRC_ALPHA,
+        D3D12_BLEND_INV_SRC_ALPHA,
+        D3D12_BLEND_DEST_COLOR,
+        D3D12_BLEND_INV_DEST_COLOR,
+        D3D12_BLEND_DEST_ALPHA,
+        D3D12_BLEND_INV_DEST_ALPHA,
+        D3D12_BLEND_BLEND_FACTOR,
+        D3D12_BLEND_INV_BLEND_FACTOR,
         D3D12_BLEND_SRC_ALPHA_SAT,
+        alpha_blend_factor_supported ? D3D12_BLEND_ALPHA_FACTOR
+                                     : D3D12_BLEND_BLEND_FACTOR,
+        alpha_blend_factor_supported ? D3D12_BLEND_INV_ALPHA_FACTOR
+                                     : D3D12_BLEND_INV_BLEND_FACTOR,
     };
     // 8 entries for safety since 3 bits from the guest are passed directly.
     static constexpr D3D12_BLEND_OP kBlendOpMap[] = {
