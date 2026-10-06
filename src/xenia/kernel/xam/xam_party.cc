@@ -10,6 +10,9 @@
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xam/xam_private.h"
+#include "xenia/kernel/xnet.h"
+
+DECLARE_int32(network_mode);
 
 namespace xe {
 namespace kernel {
@@ -18,8 +21,19 @@ namespace xam {
 // XamPartyPartyCreate, XamPartyLeave, XamPartySendInvite, XamPartyJoinEx, &
 // XamPartyRemoveLocalUsers share one function
 
-dword_result_t XamPartyGetUserList_entry(dword_t caller,
-                                         lpvoid_t party_list_ptr) {
+dword_result_t XamPartyGetUserList_entry(
+    dword_t caller, pointer_t<X_PARTY_USER_LIST> party_list_ptr) {
+  // Netplay behavior while networked (System Link / Xbox Live): the party
+  // system is unused by netplay titles, so report not-in-party instead of
+  // failing. Offline keeps the upstream caller validation.
+  if (cvars::network_mode != NETWORK_MODE::OFFLINE) {
+    if (party_list_ptr) {
+      party_list_ptr.Zero();
+    }
+
+    // 5345085D, 45410923
+    return X_PARTY_E_NOT_IN_PARTY;
+  }
   if (caller != 1) {
     return X_E_NOT_IMPLEMENTED;
   }
@@ -52,8 +66,14 @@ dword_result_t XamPartySendGameInvites_entry(
 }
 DECLARE_XAM_EXPORT1(XamPartySendGameInvites, kNone, kStub);
 
-dword_result_t XamPartySetCustomData_entry(dword_t caller, dword_t user_index,
-                                           lpvoid_t custom_data_ptr) {
+dword_result_t XamPartySetCustomData_entry(
+    dword_t caller, dword_t user_index,
+    pointer_t<X_PARTY_CUSTOM_DATA> custom_data_ptr) {
+  // Netplay behavior while networked: accept silently. Offline keeps the
+  // upstream caller validation.
+  if (cvars::network_mode != NETWORK_MODE::OFFLINE) {
+    return X_ERROR_SUCCESS;
+  }
   if (caller != 1) {
     return X_E_NOT_IMPLEMENTED;
   } else if (user_index >= XUserMaxUserCount) {
