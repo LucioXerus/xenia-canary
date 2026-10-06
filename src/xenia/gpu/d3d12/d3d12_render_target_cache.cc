@@ -81,6 +81,7 @@ namespace shaders {
 #include "xenia/gpu/shaders/bytecode/d3d12_5_1/resolve_clear_32bpp_scaled_cs.h"
 #include "xenia/gpu/shaders/bytecode/d3d12_5_1/resolve_clear_64bpp_cs.h"
 #include "xenia/gpu/shaders/bytecode/d3d12_5_1/resolve_clear_64bpp_scaled_cs.h"
+#include "xenia/gpu/shaders/bytecode/d3d12_5_1/resolve_dxt3aas1111_cs.h"
 #include "xenia/gpu/shaders/bytecode/d3d12_5_1/resolve_fast_32bpp_1x2xmsaa_cs.h"
 #include "xenia/gpu/shaders/bytecode/d3d12_5_1/resolve_fast_32bpp_1x2xmsaa_scaled_cs.h"
 #include "xenia/gpu/shaders/bytecode/d3d12_5_1/resolve_fast_32bpp_4xmsaa_cs.h"
@@ -136,6 +137,8 @@ constexpr D3D12RenderTargetCache::ResolveCopyShaderCode
          sizeof(shaders::resolve_full_128bpp_cs),
          shaders::resolve_full_128bpp_scaled_cs,
          sizeof(shaders::resolve_full_128bpp_scaled_cs)},
+        {shaders::resolve_dxt3aas1111_cs,
+         sizeof(shaders::resolve_dxt3aas1111_cs), nullptr, 0},
 };
 
 constexpr uint32_t D3D12RenderTargetCache::kTransferUsedRootParameters[size_t(
@@ -418,29 +421,9 @@ bool D3D12RenderTargetCache::Initialize() {
         kResolveCopyShaders[i];
     // Somewhat verification whether resolve_copy_shaders_ is up to date.
     assert_true(resolve_copy_shader_code.unscaled &&
-                resolve_copy_shader_code.unscaled_size &&
-                resolve_copy_shader_code.scaled &&
-                resolve_copy_shader_code.scaled_size);
-    ID3D12PipelineState* resolve_copy_pipeline =
-        ui::d3d12::util::CreateComputePipeline(
-            device,
-            draw_resolution_scaled ? resolve_copy_shader_code.scaled
-                                   : resolve_copy_shader_code.unscaled,
-            draw_resolution_scaled ? resolve_copy_shader_code.scaled_size
-                                   : resolve_copy_shader_code.unscaled_size,
-            resolve_copy_root_signature_);
-    if (resolve_copy_pipeline == nullptr) {
-      XELOGE(
-          "D3D12RenderTargetCache: Failed to create {} resolve copy pipeline",
-          resolve_copy_shader_info.debug_name);
-      Shutdown();
-      return false;
-    }
+                resolve_copy_shader_code.unscaled_size);
     std::u16string resolve_copy_pipeline_name =
         xe::to_utf16(resolve_copy_shader_info.debug_name);
-    resolve_copy_pipeline->SetName(
-        reinterpret_cast<LPCWSTR>(resolve_copy_pipeline_name.c_str()));
-    resolve_copy_pipelines_[i] = resolve_copy_pipeline;
     if (draw_resolution_scaled) {
       // Unscaled variant for fully native resolves.
       ID3D12PipelineState* resolve_copy_native_pipeline =
@@ -460,6 +443,27 @@ bool D3D12RenderTargetCache::Initialize() {
           reinterpret_cast<LPCWSTR>(resolve_copy_pipeline_name.c_str()));
       resolve_copy_native_pipelines_[i] = resolve_copy_native_pipeline;
     }
+    if (draw_resolution_scaled && !resolve_copy_shader_code.scaled) {
+      continue;
+    }
+    ID3D12PipelineState* resolve_copy_pipeline =
+        ui::d3d12::util::CreateComputePipeline(
+            device,
+            draw_resolution_scaled ? resolve_copy_shader_code.scaled
+                                   : resolve_copy_shader_code.unscaled,
+            draw_resolution_scaled ? resolve_copy_shader_code.scaled_size
+                                   : resolve_copy_shader_code.unscaled_size,
+            resolve_copy_root_signature_);
+    if (resolve_copy_pipeline == nullptr) {
+      XELOGE(
+          "D3D12RenderTargetCache: Failed to create {} resolve copy pipeline",
+          resolve_copy_shader_info.debug_name);
+      Shutdown();
+      return false;
+    }
+    resolve_copy_pipeline->SetName(
+        reinterpret_cast<LPCWSTR>(resolve_copy_pipeline_name.c_str()));
+    resolve_copy_pipelines_[i] = resolve_copy_pipeline;
   }
 
   // Using the cvar on emulator initialization so used pipelines are consistent
@@ -1219,10 +1223,11 @@ void D3D12RenderTargetCache::BeginSubmission() {
 
 bool D3D12RenderTargetCache::Update(
     bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
-    uint32_t normalized_color_mask, const Shader& vertex_shader) {
-  if (!RenderTargetCache::Update(is_rasterization_done,
-                                 normalized_depth_control,
-                                 normalized_color_mask, vertex_shader)) {
+    uint32_t normalized_color_mask, const Shader& vertex_shader,
+    int32_t window_offset_tiles) {
+  if (!RenderTargetCache::Update(
+          is_rasterization_done, normalized_depth_control,
+          normalized_color_mask, vertex_shader, window_offset_tiles)) {
     return false;
   }
   switch (GetPath()) {
@@ -1372,31 +1377,41 @@ bool D3D12RenderTargetCache::Resolve(const Memory& memory,
   DeferredCommandList& command_list =
       command_processor_.GetDeferredCommandList();
 
+  // Copy at 1x1 if all render targets owning the source are native.
+  bool copy_native = false;
+  uint32_t dump_base = 0;
+  uint32_t dump_row_length_used = 0;
+  uint32_t dump_rows = 0;
+  uint32_t dump_pitch = 0;
+  if (resolve_info.copy_dest_extent_length &&
+      GetPath() == Path::kHostRenderTargets) {
+    resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used,
+                                      dump_rows, dump_pitch);
+    copy_native = IsResolveSourceNativeOnly(dump_base, dump_row_length_used,
+                                            dump_rows, dump_pitch);
+    if (copy_native) {
+      // Redo the resolve info at 1x1 for the unscaled copy shader.
+      if (!draw_util::GetResolveInfo(register_file(), memory, trace_writer_, 1,
+                                     1, fixed_16_truncated_to_minus_1_to_1,
+                                     fixed_16_truncated_to_minus_1_to_1,
+                                     resolve_info)) {
+        return false;
+      }
+    }
+  }
+  if (resolve_info.copy_dest_extent_length && draw_resolution_scaled &&
+      !copy_native &&
+      resolve_info.rb_copy_control.copy_command ==
+          xenos::CopyCommand::kConvertTo1111) {
+    XELOGW("Resolve copy command 2 is not supported with resolution scaling");
+    // Skip the copy, but still perform the clears.
+    resolve_info.copy_dest_extent_length = 0;
+  }
+
   // Copying.
   bool copied = false;
   if (resolve_info.copy_dest_extent_length) {
-    // If everything owning the source is native, copy at 1x1 into shared
-    // memory.
-    bool copy_native = false;
     if (GetPath() == Path::kHostRenderTargets) {
-      uint32_t dump_base;
-      uint32_t dump_row_length_used;
-      uint32_t dump_rows;
-      uint32_t dump_pitch;
-      resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used,
-                                        dump_rows, dump_pitch);
-      copy_native = IsResolveSourceNativeOnly(dump_base, dump_row_length_used,
-                                              dump_rows, dump_pitch);
-      if (copy_native) {
-        // Redo the resolve info at 1x1 so the scale-dependent fields match
-        // what the unscaled copy shaders expect.
-        if (!draw_util::GetResolveInfo(register_file(), memory, trace_writer_,
-                                       1, 1, fixed_16_truncated_to_minus_1_to_1,
-                                       fixed_16_truncated_to_minus_1_to_1,
-                                       resolve_info)) {
-          return false;
-        }
-      }
       // Dump the current contents of the render targets owning the affected
       // range to edram_buffer_.
       // TODO(Triang3l): Direct host render target -> shared memory resolve
@@ -3223,19 +3238,27 @@ D3D12RenderTargetCache::GetOrCreateTransferPipelines(TransferShaderKey key) {
 
   // Apply the source 32bpp tile index.
   // r1.w = destination to source EDRAM tile adjustment
-  a.OpIBFE(dxbc::Dest::R(1, 0b1000),
-           dxbc::Src::LU(xenos::kEdramBaseTilesBits + 1),
+  a.OpUBFE(dxbc::Dest::R(1, 0b1000), dxbc::Src::LU(xenos::kEdramBaseTilesBits),
            dxbc::Src::LU(xenos::kEdramPitchTilesBits * 2),
            dxbc::Src::CB(cbuffer_index_address, kTransferCBVRegisterAddress, 0,
                          dxbc::Src::kXXXX));
-  // r1.w = 32bpp tile index within the source, or the tile index within the
-  //        source minus the EDRAM tile count if transferring across addressing
-  //        wrapping (if negative)
+  // r1.w = 32bpp tile index within the source, not wrapped yet
   a.OpIAdd(dxbc::Dest::R(1, 0b1000), dxbc::Src::R(0, dxbc::Src::kZZZZ),
            dxbc::Src::R(1, dxbc::Src::kWWWW));
   // r1.w = 32bpp tile index within the source
   a.OpAnd(dxbc::Dest::R(1, 0b1000), dxbc::Src::R(1, dxbc::Src::kWWWW),
           dxbc::Src::LU(xenos::kEdramTileCount - 1));
+  // r2.x = source in the next period
+  a.OpUBFE(dxbc::Dest::R(2, 0b0001), dxbc::Src::LU(1),
+           dxbc::Src::LU(xenos::kEdramPitchTilesBits * 2 +
+                         xenos::kEdramBaseTilesBits),
+           dxbc::Src::CB(cbuffer_index_address, kTransferCBVRegisterAddress, 0,
+                         dxbc::Src::kXXXX));
+  // r1.w = 32bpp tile index within the source, a period down in the next one
+  // r2.x = free
+  a.OpUMAd(dxbc::Dest::R(1, 0b1000), dxbc::Src::R(2, dxbc::Src::kXXXX),
+           dxbc::Src::LU(xenos::kEdramTileCount),
+           dxbc::Src::R(1, dxbc::Src::kWWWW));
   // r2.x = source pitch in 32bpp tiles
   a.OpUBFE(dxbc::Dest::R(2, 0b0001), dxbc::Src::LU(xenos::kEdramPitchTilesBits),
            dxbc::Src::LU(xenos::kEdramPitchTilesBits),
@@ -4001,16 +4024,14 @@ D3D12RenderTargetCache::GetOrCreateTransferPipelines(TransferShaderKey key) {
               // Adjust the tile index from the destination to the host depth
               // source.
               // r0.w = destination to host depth source EDRAM tile adjustment
-              a.OpIBFE(dxbc::Dest::R(0, 0b1000),
-                       dxbc::Src::LU(xenos::kEdramBaseTilesBits + 1),
+              a.OpUBFE(dxbc::Dest::R(0, 0b1000),
+                       dxbc::Src::LU(xenos::kEdramBaseTilesBits),
                        dxbc::Src::LU(xenos::kEdramPitchTilesBits * 2),
                        dxbc::Src::CB(cbuffer_index_host_depth_address,
                                      kTransferCBVRegisterHostDepthAddress, 0,
                                      dxbc::Src::kXXXX));
-              // r0.z = tile index relative to the host depth source base, or
-              //        the tile index within the host depth source minus the
-              //        EDRAM tile count if transferring across addressing
-              //        wrapping (if negative)
+              // r0.z = tile index relative to the host depth source base, not
+              //        wrapped yet
               // r0.w = free
               a.OpIAdd(dxbc::Dest::R(0, 0b0100),
                        dxbc::Src::R(0, dxbc::Src::kZZZZ),
@@ -4538,9 +4559,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
       Transfer::Rectangle
           transfer_rectangles[Transfer::kMaxRectanglesWithCutout];
       uint32_t transfer_rectangle_count = transfer.GetRectangles(
-          dest_rt_key.base_tiles, dest_rt_key.pitch_tiles_at_32bpp,
-          dest_rt_key.msaa_samples, false, transfer_rectangles,
-          resolve_clear_rectangle);
+          dest_rt_key, transfer_rectangles, resolve_clear_rectangle);
       assert_not_zero(transfer_rectangle_count);
       HostDepthStoreRectangleConstant host_depth_store_rectangle_constant;
       for (uint32_t j = 0; j < transfer_rectangle_count; ++j) {
@@ -4783,7 +4802,6 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
       }
 
       uint32_t dest_pitch_tiles = dest_rt_key.GetPitchTiles();
-      bool dest_is_64bpp = dest_rt_key.Is64bpp();
       // GetRectangles returns guest pixels.
       // Scale to the destination.
       float pixels_to_ndc_x =
@@ -4860,10 +4878,8 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
             new_transfer_shader_key.mode =
                 source_rt_key.is_depth ? TransferMode::kDepthToStencilBit
                                        : TransferMode::kColorToStencilBit;
-            stencil_clear_rectangle_count +=
-                transfer.GetRectangles(dest_rt_key.base_tiles, dest_pitch_tiles,
-                                       dest_rt_key.msaa_samples, dest_is_64bpp,
-                                       nullptr, resolve_clear_rectangle);
+            stencil_clear_rectangle_count += transfer.GetRectangles(
+                dest_rt_key, nullptr, resolve_clear_rectangle);
           } else {
             if (dest_rt_key.is_depth) {
               if (host_depth_source_d3d12_rt) {
@@ -4909,8 +4925,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
           Transfer::Rectangle transfer_stencil_clear_rectangles
               [Transfer::kMaxRectanglesWithCutout];
           uint32_t transfer_stencil_clear_rectangle_count =
-              transfer.GetRectangles(dest_rt_key.base_tiles, dest_pitch_tiles,
-                                     dest_rt_key.msaa_samples, dest_is_64bpp,
+              transfer.GetRectangles(dest_rt_key,
                                      transfer_stencil_clear_rectangles,
                                      resolve_clear_rectangle);
           for (uint32_t j = 0; j < transfer_stencil_clear_rectangle_count;
@@ -4966,18 +4981,14 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
         auto it_merged_first = it, it_merged_last = it;
         uint32_t transfer_rectangle_count =
             transfer_invocation_first.transfer.GetRectangles(
-                dest_rt_key.base_tiles, dest_pitch_tiles,
-                dest_rt_key.msaa_samples, dest_is_64bpp, nullptr,
-                resolve_clear_rectangle);
+                dest_rt_key, nullptr, resolve_clear_rectangle);
         for (auto it_merge = std::next(it_merged_first);
              it_merge != current_transfer_invocations_.cend(); ++it_merge) {
           if (!transfer_invocation_first.CanBeMergedIntoOneDraw(*it_merge)) {
             break;
           }
           transfer_rectangle_count += it_merge->transfer.GetRectangles(
-              dest_rt_key.base_tiles, dest_pitch_tiles,
-              dest_rt_key.msaa_samples, dest_is_64bpp, nullptr,
-              resolve_clear_rectangle);
+              dest_rt_key, nullptr, resolve_clear_rectangle);
           it_merged_last = it_merge;
         }
         assert_not_zero(transfer_rectangle_count);
@@ -5042,10 +5053,9 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
           Transfer::Rectangle transfer_invocation_rectangles
               [Transfer::kMaxRectanglesWithCutout];
           uint32_t transfer_invocation_rectangle_count =
-              it_merged->transfer.GetRectangles(
-                  dest_rt_key.base_tiles, dest_pitch_tiles,
-                  dest_rt_key.msaa_samples, dest_is_64bpp,
-                  transfer_invocation_rectangles, resolve_clear_rectangle);
+              it_merged->transfer.GetRectangles(dest_rt_key,
+                                                transfer_invocation_rectangles,
+                                                resolve_clear_rectangle);
           assert_not_zero(transfer_invocation_rectangle_count);
           for (uint32_t j = 0; j < transfer_invocation_rectangle_count; ++j) {
             const Transfer::Rectangle& transfer_rectangle =
@@ -5174,8 +5184,11 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
           TransferAddressConstant address_constant;
           address_constant.dest_pitch = dest_pitch_tiles;
           address_constant.source_pitch = source_rt_key.GetPitchTiles();
-          address_constant.source_to_dest = int32_t(dest_rt_key.base_tiles) -
-                                            int32_t(source_rt_key.base_tiles);
+          address_constant.source_to_dest =
+              (uint32_t(dest_rt_key.base_tiles) -
+               uint32_t(source_rt_key.base_tiles)) &
+              (xenos::kEdramTileCount - 1);
+          address_constant.source_next_period = source_rt_key.next_period;
           if (last_address_constant != address_constant) {
             last_address_constant = address_constant;
             transfer_root_parameters_set &=
@@ -5192,8 +5205,9 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
           host_depth_address_constant.source_pitch =
               host_depth_source_rt_key.GetPitchTiles();
           host_depth_address_constant.source_to_dest =
-              int32_t(dest_rt_key.base_tiles) -
-              int32_t(host_depth_source_rt_key.base_tiles);
+              (uint32_t(dest_rt_key.base_tiles) -
+               uint32_t(host_depth_source_rt_key.base_tiles)) &
+              (xenos::kEdramTileCount - 1);
           if (last_host_depth_address_constant != host_depth_address_constant) {
             last_host_depth_address_constant = host_depth_address_constant;
             transfer_root_parameters_set &=
@@ -5950,7 +5964,7 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(
   // r0.z = first EDRAM tile index in the dispatch
   // r0.w = tile index relative to the dump rectangle base
   a.OpUBFE(dxbc::Dest::R(0, 0b0100),
-           dxbc::Src::LU(xenos::kEdramBaseTilesBits + 1), dxbc::Src::LU(0),
+           dxbc::Src::LU(xenos::kEdramBaseTilesBits + 2), dxbc::Src::LU(0),
            dxbc::Src::CB(kDumpCbufferOffsets, kDumpCbufferOffsets, 0,
                          dxbc::Src::kXXXX));
   // Add the base tile in the dispatch to the dispatch-local tile index to r0.w,
@@ -6028,7 +6042,7 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(
   // r0.w = non-wrapped tile index in the EDRAM
   // r1.x = source texture base tile index
   a.OpUBFE(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(xenos::kEdramBaseTilesBits),
-           dxbc::Src::LU(xenos::kEdramBaseTilesBits + 1),
+           dxbc::Src::LU(xenos::kEdramBaseTilesBits + 2),
            dxbc::Src::CB(kDumpCbufferOffsets, kDumpCbufferOffsets, 0,
                          dxbc::Src::kXXXX));
   // Get the linear tile index within the source texture to r0.w.
@@ -6623,7 +6637,8 @@ void D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base,
         rectangle.GetDispatches(dump_pitch, dump_row_length_used, dispatches);
     for (uint32_t i = 0; i < dispatch_count; ++i) {
       const ResolveCopyDumpRectangle::Dispatch& dispatch = dispatches[i];
-      offsets.dispatch_first_tile = dump_base + dispatch.offset;
+      offsets.dispatch_first_tile =
+          rt_key.GetNonWrappedTileIndex(dump_base + dispatch.offset);
       if (last_offsets != offsets) {
         last_offsets = offsets;
         root_parameters_set &= ~kDumpRootParameterOffsetsBit;

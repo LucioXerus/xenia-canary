@@ -32,9 +32,9 @@ DECLARE_int32(occlusion_query_fake_lower_threshold);
 
 DECLARE_int32(occlusion_query_fake_upper_threshold);
 
-DECLARE_int32(occlusion_query_querybatch_range);
+DECLARE_bool(occlusion_query_full_counters);
 
-DECLARE_double(occlusion_query_saturation);
+DECLARE_bool(occlusion_query_viz);
 
 DECLARE_int32(anisotropic_override);
 
@@ -47,6 +47,8 @@ DECLARE_bool(async_shader_compilation);
 DECLARE_bool(gpu_3d_to_2d_texture);
 
 DECLARE_bool(force_depth_clamp);
+
+DECLARE_bool(mulsc_round_toward_zero);
 
 #define XE_GPU_FINE_GRAINED_DRAW_SCOPES 1
 

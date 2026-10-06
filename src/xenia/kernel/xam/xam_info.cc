@@ -392,12 +392,6 @@ dword_result_t XamGetCachedTitleName_entry(dword_t title_id,
 }
 DECLARE_XAM_EXPORT1(XamGetCachedTitleName, kNone, kImplemented);
 
-dword_result_t XamXStudioRequest_entry(dword_t unk1, lpdword_t unk2) {
-  // uses xstudio.xex function with an ordinal of 1
-  return X_E_FAIL;
-}
-DECLARE_XAM_EXPORT1(XamXStudioRequest, kNone, kStub);
-
 dword_result_t XamReadString_entry(dword_t title_id, qword_t id,
                                    dword_t user_index, dword_t string_out_ptr,
                                    lpdword_t string_size_ptr,
@@ -441,6 +435,12 @@ dword_result_t XamReadString_entry(dword_t title_id, qword_t id,
   return X_ERROR_IO_PENDING;
 }
 DECLARE_XAM_EXPORT1(XamReadString, kNone, kImplemented);
+
+dword_result_t XamXStudioRequest_entry(dword_t unk1, lpdword_t unk2) {
+  // uses xstudio.xex function with an ordinal of 1
+  return X_E_FAIL;
+}
+DECLARE_XAM_EXPORT1(XamXStudioRequest, kNone, kStub);
 
 dword_result_t XamGetSystemVersion_entry() {
   // eh, just picking one. If we go too low we may break new games, but
@@ -509,6 +509,15 @@ dword_result_t XamGetExecutionId_entry(lpdword_t info_ptr) {
   return X_STATUS_SUCCESS;
 }
 DECLARE_XAM_EXPORT1(XamGetExecutionId, kNone, kImplemented);
+
+void XamLoaderRegisterLaunchRequestCallback_entry(dword_t callback) {
+  auto xam = kernel_state()->GetKernelModule<XamModule>("xam.xex");
+  if (xam) {
+    xam->SetLaunchCallback(callback);
+  }
+}
+DECLARE_XAM_EXPORT1(XamLoaderRegisterLaunchRequestCallback, kNone,
+                    kImplemented);
 
 dword_result_t XamLoaderSetLaunchData_entry(lpvoid_t data, dword_t size) {
   auto xam = kernel_state()->GetKernelModule<XamModule>("xam.xex");
@@ -1109,7 +1118,29 @@ DECLARE_XAM_EXPORT1(XamSetDvrStorage, kNone, kStub);
 dword_result_t XamLookupCommonStringByIndex_entry(dword_t string_index) {
   return 0;
 }
-DECLARE_XAM_EXPORT1(XamLookupCommonStringByIndex, kNone, kImplemented);
+DECLARE_XAM_EXPORT1(XamLookupCommonStringByIndex, kNone, kStub);
+
+dword_result_t XamLogLocalizationEtx_entry(dword_t error_code, dword_t unk) {
+  if (error_code == 0x80300034) {
+    // uses second unk for some function
+    return X_ERROR_SUCCESS;
+  } else if (error_code == 0x80300035) {
+    // uses second unk for some function
+    return X_ERROR_SUCCESS;
+  }
+  return X_E_NOT_IMPLEMENTED;
+}
+DECLARE_XAM_EXPORT1(XamLogLocalizationEtx, kNone, kStub);
+
+dword_result_t XamUpdateGetBaseSystemVersion_entry() {
+  return kBaseKernelBuildVersion;
+}
+DECLARE_XAM_EXPORT1(XamUpdateGetBaseSystemVersion, kNone, kStub);
+
+dword_result_t XamUpdateGetCurrentSystemVersion_entry() {
+  return kBaseKernelBuildVersion;
+}
+DECLARE_XAM_EXPORT1(XamUpdateGetCurrentSystemVersion, kNone, kStub);
 
 }  // namespace xam
 }  // namespace kernel

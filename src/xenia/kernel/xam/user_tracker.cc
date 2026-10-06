@@ -183,8 +183,7 @@ void UserTracker::AddTitleToPlayedList(uint64_t xuid) {
   }
 
   const uint32_t title_id = spa_data_->title_id();
-  auto title_gpd = user->games_gpd_.find(title_id);
-  if (title_gpd == user->games_gpd_.end()) {
+  if (!user->games_gpd_.contains(title_id)) {
     user->games_gpd_.emplace(title_id, GpdInfoTitle(title_id));
     UpdateTitleGpdFile();
   }
@@ -610,7 +609,7 @@ std::u16string UserTracker::GetPropertyDescription(uint32_t id) const {
 
 // Privates
 bool UserTracker::IsUserTracked(uint64_t xuid) const {
-  return tracked_xuids_.find(xuid) != tracked_xuids_.cend();
+  return tracked_xuids_.contains(xuid);
 }
 
 std::optional<TitleInfo> UserTracker::GetUserTitleInfo(
@@ -1024,6 +1023,30 @@ bool UserTracker::GetUserSetting(uint64_t xuid, uint32_t title_id,
 
   setting->WriteToGuest(setting_ptr, extended_data_address);
   return true;
+}
+
+std::pair<uint32_t, uint32_t> UserTracker::GetUserSubscriptionData(
+    UserProfile* user) const {
+  std::pair<uint32_t, uint32_t> data;
+  if (const auto setting = GetSetting(
+          user, kDashboardID,
+          static_cast<uint32_t>(
+              UserSettingId::XPROFILE_SUBSCRIPTION_TYPE_LENGTH_IN_MONTHS))) {
+    data.first = std::get<int32_t>(setting->get_host_data());
+  } else {
+    data.first = 0;
+  }
+
+  if (const auto setting =
+          GetSetting(user, kDashboardID,
+                     static_cast<uint32_t>(
+                         UserSettingId::XPROFILE_SUBSCRIPTION_PAYMENT_TYPE))) {
+    data.second = std::get<int32_t>(setting->get_host_data());
+  } else {
+    data.second = 0;
+  }
+
+  return data;
 }
 
 void UserTracker::UpdateContext(uint64_t xuid, uint32_t id, uint32_t value) {

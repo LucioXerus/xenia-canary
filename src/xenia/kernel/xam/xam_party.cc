@@ -15,18 +15,21 @@ namespace xe {
 namespace kernel {
 namespace xam {
 
-dword_result_t XamPartyGetUserList_entry(
-    dword_t caller, pointer_t<X_PARTY_USER_LIST> party_list_ptr) {
-  if (party_list_ptr) {
-    party_list_ptr.Zero();
-  }
+// XamPartyPartyCreate, XamPartyLeave, XamPartySendInvite, XamPartyJoinEx, &
+// XamPartyRemoveLocalUsers share one function
 
+dword_result_t XamPartyGetUserList_entry(dword_t caller,
+                                         lpvoid_t party_list_ptr) {
+  if (caller != 1) {
+    return X_E_NOT_IMPLEMENTED;
+  }
   // 5345085D, 45410923
-  return X_PARTY_E_NOT_IN_PARTY;
+  return 0x807D0003;  // X_PARTY_E_NOT_IN_PARTY
 }
 DECLARE_XAM_EXPORT1(XamPartyGetUserList, kNone, kStub);
 
-// Show UI to invite party members to a multiplayer session?
+// Shares same function as XamPartyAddLocalUsers, XamPartyKickUser,
+// XamPartyGetJoinable, XamPartySetJoinable, & XamPartyGetInfoEx
 dword_result_t XamPartySendGameInvites_entry(
     dword_t caller, dword_t user_index, dword_t unknown,
     pointer_t<XAM_OVERLAPPED> overlapped_ptr) {
@@ -49,10 +52,14 @@ dword_result_t XamPartySendGameInvites_entry(
 }
 DECLARE_XAM_EXPORT1(XamPartySendGameInvites, kNone, kStub);
 
-dword_result_t XamPartySetCustomData_entry(
-    dword_t caller, dword_t user_index,
-    pointer_t<X_PARTY_CUSTOM_DATA> custom_data_ptr) {
-  return X_ERROR_SUCCESS;
+dword_result_t XamPartySetCustomData_entry(dword_t caller, dword_t user_index,
+                                           lpvoid_t custom_data_ptr) {
+  if (caller != 1) {
+    return X_E_NOT_IMPLEMENTED;
+  } else if (user_index >= XUserMaxUserCount) {
+    return 0x807D0002;
+  }
+  return 0x807D0003;  // X_PARTY_E_NOT_IN_PARTY
 }
 DECLARE_XAM_EXPORT1(XamPartySetCustomData, kNone, kStub);
 

@@ -160,7 +160,7 @@ class UserProfile {
       icon_type = XTileType::kGamerTileSmall;
     }
 
-    if (profile_images_.find(icon_type) == profile_images_.cend()) {
+    if (!profile_images_.contains(icon_type)) {
       return {};
     }
 

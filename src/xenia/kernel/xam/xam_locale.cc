@@ -416,6 +416,18 @@ dword_result_t XamProfileGetLiveLegalLocale_entry(qword_t xuid,
 }
 DECLARE_XAM_EXPORT1(XamProfileGetLiveLegalLocale, kLocale, kImplemented);
 
+dword_result_t XapipGetLocale_entry(dword_t buffer_length,
+                                    lpstring_t buffer_ptr) {
+  char16_t buffer[7];
+  auto result = XamProfileGetLiveLegalLocale_entry(0, 7, buffer);
+  if (result == X_E_SUCCESS) {
+    string_util::copy_truncating(buffer_ptr, to_utf8(buffer), buffer_length);
+  }
+
+  return result;
+}
+DECLARE_XAM_EXPORT1(XapipGetLocale, kLocale, kImplemented);
+
 dword_result_t XamGetLocaleString_entry(dword_t id, dword_t buffer_length,
                                         lpu16string_t buffer) {
   if (buffer_length >= 0x80000000u) {

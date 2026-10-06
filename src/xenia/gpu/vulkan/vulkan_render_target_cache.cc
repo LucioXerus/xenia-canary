@@ -65,6 +65,7 @@ namespace shaders {
 #include "xenia/gpu/shaders/bytecode/vulkan_spirv/resolve_clear_32bpp_scaled_cs.h"
 #include "xenia/gpu/shaders/bytecode/vulkan_spirv/resolve_clear_64bpp_cs.h"
 #include "xenia/gpu/shaders/bytecode/vulkan_spirv/resolve_clear_64bpp_scaled_cs.h"
+#include "xenia/gpu/shaders/bytecode/vulkan_spirv/resolve_dxt3aas1111_cs.h"
 #include "xenia/gpu/shaders/bytecode/vulkan_spirv/resolve_fast_32bpp_1x2xmsaa_cs.h"
 #include "xenia/gpu/shaders/bytecode/vulkan_spirv/resolve_fast_32bpp_1x2xmsaa_scaled_cs.h"
 #include "xenia/gpu/shaders/bytecode/vulkan_spirv/resolve_fast_32bpp_4xmsaa_cs.h"
@@ -120,6 +121,8 @@ const VulkanRenderTargetCache::ResolveCopyShaderCode
          sizeof(shaders::resolve_full_128bpp_cs),
          shaders::resolve_full_128bpp_scaled_cs,
          sizeof(shaders::resolve_full_128bpp_scaled_cs)},
+        {shaders::resolve_dxt3aas1111_cs,
+         sizeof(shaders::resolve_dxt3aas1111_cs), nullptr, 0},
 };
 
 const VulkanRenderTargetCache::TransferPipelineLayoutInfo
@@ -506,26 +509,7 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
         kResolveCopyShaders[i];
     // Somewhat verification whether resolve_copy_shaders_ is up to date.
     assert_true(resolve_copy_shader_code.unscaled &&
-                resolve_copy_shader_code.unscaled_size_bytes &&
-                resolve_copy_shader_code.scaled &&
-                resolve_copy_shader_code.scaled_size_bytes);
-    VkPipeline resolve_copy_pipeline = ui::vulkan::util::CreateComputePipeline(
-        vulkan_device, resolve_copy_pipeline_layout_,
-        draw_resolution_scaled ? resolve_copy_shader_code.scaled
-                               : resolve_copy_shader_code.unscaled,
-        draw_resolution_scaled ? resolve_copy_shader_code.scaled_size_bytes
-                               : resolve_copy_shader_code.unscaled_size_bytes);
-    if (resolve_copy_pipeline == VK_NULL_HANDLE) {
-      XELOGE(
-          "VulkanRenderTargetCache: Failed to create the resolve copy "
-          "pipeline {}",
-          resolve_copy_shader_info.debug_name);
-      Shutdown();
-      return false;
-    }
-    vulkan_device->SetObjectName(VK_OBJECT_TYPE_PIPELINE, resolve_copy_pipeline,
-                                 resolve_copy_shader_info.debug_name);
-    resolve_copy_pipelines_[i] = resolve_copy_pipeline;
+                resolve_copy_shader_code.unscaled_size_bytes);
     if (draw_resolution_scaled) {
       // Unscaled variant for fully native resolves.
       VkPipeline resolve_copy_native_pipeline =
@@ -546,6 +530,26 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
                                    resolve_copy_shader_info.debug_name);
       resolve_copy_native_pipelines_[i] = resolve_copy_native_pipeline;
     }
+    if (draw_resolution_scaled && !resolve_copy_shader_code.scaled) {
+      continue;
+    }
+    VkPipeline resolve_copy_pipeline = ui::vulkan::util::CreateComputePipeline(
+        vulkan_device, resolve_copy_pipeline_layout_,
+        draw_resolution_scaled ? resolve_copy_shader_code.scaled
+                               : resolve_copy_shader_code.unscaled,
+        draw_resolution_scaled ? resolve_copy_shader_code.scaled_size_bytes
+                               : resolve_copy_shader_code.unscaled_size_bytes);
+    if (resolve_copy_pipeline == VK_NULL_HANDLE) {
+      XELOGE(
+          "VulkanRenderTargetCache: Failed to create the resolve copy "
+          "pipeline {}",
+          resolve_copy_shader_info.debug_name);
+      Shutdown();
+      return false;
+    }
+    vulkan_device->SetObjectName(VK_OBJECT_TYPE_PIPELINE, resolve_copy_pipeline,
+                                 resolve_copy_shader_info.debug_name);
+    resolve_copy_pipelines_[i] = resolve_copy_pipeline;
   }
 
   // TODO(Triang3l): All paths (FSI).
@@ -1126,31 +1130,41 @@ bool VulkanRenderTargetCache::Resolve(
   DeferredCommandBuffer& command_buffer =
       command_processor_.deferred_command_buffer();
 
+  // Copy at 1x1 if all render targets owning the source are native.
+  bool copy_native = false;
+  uint32_t dump_base = 0;
+  uint32_t dump_row_length_used = 0;
+  uint32_t dump_rows = 0;
+  uint32_t dump_pitch = 0;
+  if (resolve_info.copy_dest_extent_length &&
+      GetPath() == Path::kHostRenderTargets) {
+    resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used,
+                                      dump_rows, dump_pitch);
+    copy_native = IsResolveSourceNativeOnly(dump_base, dump_row_length_used,
+                                            dump_rows, dump_pitch);
+    if (copy_native) {
+      // Redo the resolve info at 1x1 for the unscaled copy shader.
+      if (!draw_util::GetResolveInfo(register_file(), memory, trace_writer_, 1,
+                                     1, IsFixedRG16TruncatedToMinus1To1(),
+                                     IsFixedRGBA16TruncatedToMinus1To1(),
+                                     resolve_info)) {
+        return false;
+      }
+    }
+  }
+  if (resolve_info.copy_dest_extent_length && draw_resolution_scaled &&
+      !copy_native &&
+      resolve_info.rb_copy_control.copy_command ==
+          xenos::CopyCommand::kConvertTo1111) {
+    XELOGW("Resolve copy command 2 is not supported with resolution scaling");
+    // Skip the copy, but still perform the clears.
+    resolve_info.copy_dest_extent_length = 0;
+  }
+
   // Copying.
   bool copied = false;
   if (resolve_info.copy_dest_extent_length) {
-    // If everything owning the source is native, copy at 1x1 into shared
-    // memory.
-    bool copy_native = false;
     if (GetPath() == Path::kHostRenderTargets) {
-      uint32_t dump_base;
-      uint32_t dump_row_length_used;
-      uint32_t dump_rows;
-      uint32_t dump_pitch;
-      resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used,
-                                        dump_rows, dump_pitch);
-      copy_native = IsResolveSourceNativeOnly(dump_base, dump_row_length_used,
-                                              dump_rows, dump_pitch);
-      if (copy_native) {
-        // Redo the resolve info at 1x1 so the scale-dependent fields match
-        // what the unscaled copy shaders expect.
-        if (!draw_util::GetResolveInfo(register_file(), memory, trace_writer_,
-                                       1, 1, IsFixedRG16TruncatedToMinus1To1(),
-                                       IsFixedRGBA16TruncatedToMinus1To1(),
-                                       resolve_info)) {
-          return false;
-        }
-      }
       // Dump the current contents of the render targets owning the affected
       // range to edram_buffer_.
       // TODO(Triang3l): Direct host render target -> shared memory resolve
@@ -1510,10 +1524,11 @@ bool VulkanRenderTargetCache::Resolve(
 
 bool VulkanRenderTargetCache::Update(
     bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
-    uint32_t normalized_color_mask, const Shader& vertex_shader) {
-  if (!RenderTargetCache::Update(is_rasterization_done,
-                                 normalized_depth_control,
-                                 normalized_color_mask, vertex_shader)) {
+    uint32_t normalized_color_mask, const Shader& vertex_shader,
+    int32_t window_offset_tiles) {
+  if (!RenderTargetCache::Update(
+          is_rasterization_done, normalized_depth_control,
+          normalized_color_mask, vertex_shader, window_offset_tiles)) {
     return false;
   }
 
@@ -3154,24 +3169,28 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(
                     -int32_t(source_32bpp_tile_half_pixels)))));
   }
 
-  // Transform the destination 32bpp tile index into the source. After the
-  // addition, it may be negative - in which case, the transfer is done across
-  // EDRAM addressing wrapping, and xenos::kEdramTileCount must be added to it,
-  // but `& (xenos::kEdramTileCount - 1)` handles that regardless of the sign.
+  // Transform the destination 32bpp tile index into the source, wrapped, the
+  // base difference is stored wrapped too. Sources in the next period hold
+  // their tiles a period of rows down.
   spv::Id source_tile_index = builder.createBinOp(
-      spv::OpBitwiseAnd, type_uint,
-      builder.createUnaryOp(
-          spv::OpBitcast, type_uint,
+      spv::OpIAdd, type_uint,
+      builder.createBinOp(
+          spv::OpBitwiseAnd, type_uint,
           builder.createBinOp(
-              spv::OpIAdd, type_int,
-              builder.createUnaryOp(spv::OpBitcast, type_int, dest_tile_index),
+              spv::OpIAdd, type_uint, dest_tile_index,
               builder.createTriOp(
-                  spv::OpBitFieldSExtract, type_int,
-                  builder.createUnaryOp(spv::OpBitcast, type_int,
-                                        address_constant),
+                  spv::OpBitFieldUExtract, type_uint, address_constant,
                   builder.makeUintConstant(xenos::kEdramPitchTilesBits * 2),
-                  builder.makeUintConstant(xenos::kEdramBaseTilesBits + 1)))),
-      builder.makeUintConstant(xenos::kEdramTileCount - 1));
+                  builder.makeUintConstant(xenos::kEdramBaseTilesBits))),
+          builder.makeUintConstant(xenos::kEdramTileCount - 1)),
+      builder.createBinOp(
+          spv::OpIMul, type_uint,
+          builder.createTriOp(
+              spv::OpBitFieldUExtract, type_uint, address_constant,
+              builder.makeUintConstant(xenos::kEdramPitchTilesBits * 2 +
+                                       xenos::kEdramBaseTilesBits),
+              builder.makeUintConstant(1)),
+          builder.makeUintConstant(xenos::kEdramTileCount)));
   // Split the source 32bpp tile index into X and Y tile index within the source
   // image.
   spv::Id source_pitch_tiles = builder.createTriOp(
@@ -4047,28 +4066,18 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(
                 builder.createAccessChain(spv::StorageClassPushConstant,
                                           push_constants, id_vector_temp),
                 spv::NoPrecision);
-            // Transform the destination tile index into the host depth source.
-            // After the addition, it may be negative - in which case, the
-            // transfer is done across EDRAM addressing wrapping, and
-            // xenos::kEdramTileCount must be added to it, but
-            // `& (xenos::kEdramTileCount - 1)` handles that regardless of the
-            // sign.
+            // Transform the destination tile index into the host depth source,
+            // wrapped.
             spv::Id host_depth_source_tile_index = builder.createBinOp(
                 spv::OpBitwiseAnd, type_uint,
-                builder.createUnaryOp(
-                    spv::OpBitcast, type_uint,
-                    builder.createBinOp(
-                        spv::OpIAdd, type_int,
-                        builder.createUnaryOp(spv::OpBitcast, type_int,
-                                              dest_tile_index),
-                        builder.createTriOp(
-                            spv::OpBitFieldSExtract, type_int,
-                            builder.createUnaryOp(spv::OpBitcast, type_int,
-                                                  host_depth_address_constant),
-                            builder.makeUintConstant(
-                                xenos::kEdramPitchTilesBits * 2),
-                            builder.makeUintConstant(
-                                xenos::kEdramBaseTilesBits + 1)))),
+                builder.createBinOp(
+                    spv::OpIAdd, type_uint, dest_tile_index,
+                    builder.createTriOp(
+                        spv::OpBitFieldUExtract, type_uint,
+                        host_depth_address_constant,
+                        builder.makeUintConstant(xenos::kEdramPitchTilesBits *
+                                                 2),
+                        builder.makeUintConstant(xenos::kEdramBaseTilesBits))),
                 builder.makeUintConstant(xenos::kEdramTileCount - 1));
             // Split the host depth source tile index into X and Y tile index
             // within the source image.
@@ -4739,9 +4748,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
       Transfer::Rectangle
           transfer_rectangles[Transfer::kMaxRectanglesWithCutout];
       uint32_t transfer_rectangle_count = transfer.GetRectangles(
-          dest_rt_key.base_tiles, dest_rt_key.pitch_tiles_at_32bpp,
-          dest_rt_key.msaa_samples, false, transfer_rectangles,
-          resolve_clear_rectangle);
+          dest_rt_key, transfer_rectangles, resolve_clear_rectangle);
       assert_not_zero(transfer_rectangle_count);
       HostDepthStoreRectangleConstant host_depth_store_rectangle_constant;
       for (uint32_t j = 0; j < transfer_rectangle_count; ++j) {
@@ -4959,7 +4966,6 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
 
     if (!current_transfers.empty()) {
       uint32_t dest_pitch_tiles = dest_rt_key.GetPitchTiles();
-      bool dest_is_64bpp = dest_rt_key.Is64bpp();
 
       // Gather shader keys and sort to reduce pipeline state and binding
       // switches. Also gather stencil rectangles to clear if needed.
@@ -5029,10 +5035,8 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
             new_transfer_shader_key.mode =
                 source_rt_key.is_depth ? TransferMode::kDepthToStencilBit
                                        : TransferMode::kColorToStencilBit;
-            stencil_clear_rectangle_count +=
-                transfer.GetRectangles(dest_rt_key.base_tiles, dest_pitch_tiles,
-                                       dest_rt_key.msaa_samples, dest_is_64bpp,
-                                       nullptr, resolve_clear_rectangle);
+            stencil_clear_rectangle_count += transfer.GetRectangles(
+                dest_rt_key, nullptr, resolve_clear_rectangle);
           } else {
             if (dest_rt_key.is_depth) {
               if (host_depth_source_vulkan_rt) {
@@ -5131,8 +5135,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
           Transfer::Rectangle transfer_stencil_clear_rectangles
               [Transfer::kMaxRectanglesWithCutout];
           uint32_t transfer_stencil_clear_rectangle_count =
-              transfer.GetRectangles(dest_rt_key.base_tiles, dest_pitch_tiles,
-                                     dest_rt_key.msaa_samples, dest_is_64bpp,
+              transfer.GetRectangles(dest_rt_key,
                                      transfer_stencil_clear_rectangles,
                                      resolve_clear_rectangle);
           for (uint32_t j = 0; j < transfer_stencil_clear_rectangle_count;
@@ -5189,18 +5192,14 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
         auto it_merged_first = it, it_merged_last = it;
         uint32_t transfer_rectangle_count =
             transfer_invocation_first.transfer.GetRectangles(
-                dest_rt_key.base_tiles, dest_pitch_tiles,
-                dest_rt_key.msaa_samples, dest_is_64bpp, nullptr,
-                resolve_clear_rectangle);
+                dest_rt_key, nullptr, resolve_clear_rectangle);
         for (auto it_merge = std::next(it_merged_first);
              it_merge != current_transfer_invocations_.cend(); ++it_merge) {
           if (!transfer_invocation_first.CanBeMergedIntoOneDraw(*it_merge)) {
             break;
           }
           transfer_rectangle_count += it_merge->transfer.GetRectangles(
-              dest_rt_key.base_tiles, dest_pitch_tiles,
-              dest_rt_key.msaa_samples, dest_is_64bpp, nullptr,
-              resolve_clear_rectangle);
+              dest_rt_key, nullptr, resolve_clear_rectangle);
           it_merged_last = it_merge;
         }
         assert_not_zero(transfer_rectangle_count);
@@ -5244,10 +5243,9 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
           Transfer::Rectangle transfer_invocation_rectangles
               [Transfer::kMaxRectanglesWithCutout];
           uint32_t transfer_invocation_rectangle_count =
-              it_merged->transfer.GetRectangles(
-                  dest_rt_key.base_tiles, dest_pitch_tiles,
-                  dest_rt_key.msaa_samples, dest_is_64bpp,
-                  transfer_invocation_rectangles, resolve_clear_rectangle);
+              it_merged->transfer.GetRectangles(dest_rt_key,
+                                                transfer_invocation_rectangles,
+                                                resolve_clear_rectangle);
           assert_not_zero(transfer_invocation_rectangle_count);
           for (uint32_t j = 0; j < transfer_invocation_rectangle_count; ++j) {
             const Transfer::Rectangle& transfer_rectangle =
@@ -5357,8 +5355,9 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
           host_depth_address_constant.source_pitch =
               host_depth_source_rt_key.GetPitchTiles();
           host_depth_address_constant.source_to_dest =
-              int32_t(dest_rt_key.base_tiles) -
-              int32_t(host_depth_source_rt_key.base_tiles);
+              (uint32_t(dest_rt_key.base_tiles) -
+               uint32_t(host_depth_source_rt_key.base_tiles)) &
+              (xenos::kEdramTileCount - 1);
           if (last_host_depth_address_constant != host_depth_address_constant) {
             last_host_depth_address_constant = host_depth_address_constant;
             transfer_push_constants_set &=
@@ -5371,8 +5370,11 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
           TransferAddressConstant address_constant;
           address_constant.dest_pitch = dest_pitch_tiles;
           address_constant.source_pitch = source_rt_key.GetPitchTiles();
-          address_constant.source_to_dest = int32_t(dest_rt_key.base_tiles) -
-                                            int32_t(source_rt_key.base_tiles);
+          address_constant.source_to_dest =
+              (uint32_t(dest_rt_key.base_tiles) -
+               uint32_t(source_rt_key.base_tiles)) &
+              (xenos::kEdramTileCount - 1);
+          address_constant.source_next_period = source_rt_key.next_period;
           if (last_address_constant != address_constant) {
             last_address_constant = address_constant;
             transfer_push_constants_set &=
@@ -5774,12 +5776,12 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
       builder.createAccessChain(spv::StorageClassPushConstant, push_constants,
                                 id_vector_temp),
       spv::NoPrecision);
-  spv::Id const_edram_base_tiles_bits_plus_1 =
-      builder.makeUintConstant(xenos::kEdramBaseTilesBits + 1);
+  spv::Id const_edram_base_tiles_bits_plus_2 =
+      builder.makeUintConstant(xenos::kEdramBaseTilesBits + 2);
   spv::Id edram_tile_index_non_wrapped = builder.createBinOp(
       spv::OpIAdd, type_uint,
       builder.createTriOp(spv::OpBitFieldUExtract, type_uint, offsets_constant,
-                          const_uint_0, const_edram_base_tiles_bits_plus_1),
+                          const_uint_0, const_edram_base_tiles_bits_plus_2),
       rectangle_tile_index);
 
   // Combine the tile sample index and the tile index, wrapping the tile
@@ -5820,7 +5822,7 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
       spv::OpISub, type_uint, edram_tile_index_non_wrapped,
       builder.createTriOp(
           spv::OpBitFieldUExtract, type_uint, offsets_constant,
-          const_edram_base_tiles_bits_plus_1,
+          const_edram_base_tiles_bits_plus_2,
           builder.makeUintConstant(xenos::kEdramBaseTilesBits)));
   // Split the linear tile index in the source texture into X and Y in tiles.
   spv::Id source_pitch_tiles = builder.createTriOp(
@@ -6335,7 +6337,8 @@ void VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base,
         rectangle.GetDispatches(dump_pitch, dump_row_length_used, dispatches);
     for (uint32_t i = 0; i < dispatch_count; ++i) {
       const ResolveCopyDumpRectangle::Dispatch& dispatch = dispatches[i];
-      offsets.dispatch_first_tile = dump_base + dispatch.offset;
+      offsets.dispatch_first_tile =
+          rt_key.GetNonWrappedTileIndex(dump_base + dispatch.offset);
       if (last_offsets != offsets) {
         last_offsets = offsets;
         offsets_bound = false;
