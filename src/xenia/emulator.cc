@@ -63,6 +63,12 @@
 #include "xenia/vfs/devices/xcontent_container_device.h"
 #include "xenia/vfs/virtual_file_system.h"
 
+#if XE_PLATFORM_WIN32
+#include "xenia/kernel/util/network_adapter_manager_win.h"
+#elif XE_PLATFORM_LINUX
+#include "xenia/kernel/util/network_adapter_manager_linux.h"
+#endif
+
 #if XE_ARCH_AMD64
 #include "xenia/cpu/backend/x64/x64_backend.h"
 #elif XE_ARCH_ARM64
@@ -87,6 +93,7 @@ DEFINE_bool(allow_game_relative_writes, false,
             "General");
 
 DECLARE_bool(allow_plugins);
+DECLARE_bool(aot_preload_on_launch);
 
 DEFINE_int32(priority_class, 0,
              "Forces Xenia to use different process priority than default one. "
@@ -195,6 +202,15 @@ Emulator::~Emulator() {
   graphics_system_.reset();
   audio_system_.reset();
   audio_media_player_.reset();
+
+  // AOT: flush pending entries to disk BEFORE the kernel_state (which owns
+  // the user module) and the processor (which owns the JIT buffers) are
+  // destroyed. Buffered entries carry the module hash captured at JIT time,
+  // so FlushAllPendingAOT writes correctly-keyed .xaot files without needing
+  // a live Module*.
+  if (processor_ && processor_->backend()) {
+    processor_->backend()->FlushAllPendingAOT();
+  }
 
   kernel_state_.reset();
   file_system_.reset();
@@ -1827,6 +1843,16 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
       if (!icon_block.empty()) {
         display_window_->SetIcon(icon_block.data(), icon_block.size());
       }
+    }
+  }
+
+  // AOT: preload cached native code if available. Runs synchronously before
+  // the title's main thread resumes so preloaded functions are in place
+  // before any guest code executes.
+  if (processor_ && cvars::aot_preload_on_launch) {
+    auto* cpu_module = module->processor_module();
+    if (cpu_module && title_id_.has_value()) {
+      processor_->backend()->PreloadAOTCache(cpu_module, title_id_.value());
     }
   }
 

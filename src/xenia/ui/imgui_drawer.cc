@@ -440,7 +440,12 @@ bool ImGuiDrawer::LoadJapaneseFont(ImGuiIO& io, float font_size) {
 #endif
 
 #if XE_PLATFORM_LINUX
-  // On Linux, find and merge CJK font using fontconfig
+  // On Linux, find and merge CJK font using fontconfig.
+  // Dear ImGui uses stb_truetype, which cannot parse every font installed on
+  // the system (e.g. CFF-based .otf or variable fonts). A single unparsable
+  // font aborts the whole atlas build, leaving a 0x0 font texture behind and
+  // breaking all UI text rendering, so test every candidate in a throwaway
+  // atlas and merge only the first one that actually builds.
   FcConfig* config = FcInitLoadConfigAndFonts();
   if (!config) {
     XELOGW(
@@ -459,40 +464,62 @@ bool ImGuiDrawer::LoadJapaneseFont(ImGuiIO& io, float font_size) {
   FcConfigSubstitute(config, pattern, FcMatchPattern);
   FcDefaultSubstitute(pattern);
 
-  // Find the best matching font
+  // Get all matching fonts, best match first.
   FcResult result;
-  FcPattern* font = FcFontMatch(config, pattern, &result);
+  FcFontSet* font_set = FcFontSort(config, pattern, FcTrue, nullptr, &result);
 
-  bool success = false;
-  if (font) {
-    FcChar8* file = nullptr;
-    if (FcPatternGetString(font, FC_FILE, 0, &file) == FcResultMatch) {
-      const char* font_path = reinterpret_cast<const char*>(file);
-
-      if (std::filesystem::exists(font_path)) {
-        ImFontConfig jp_font_config;
-        jp_font_config.MergeMode = true;
-        jp_font_config.OversampleH = jp_font_config.OversampleV = 2;
-        jp_font_config.PixelSnapH = true;
-
-        io.Fonts->AddFontFromFileTTF(font_path, font_size, &jp_font_config,
-                                     io.Fonts->GetGlyphRangesJapanese());
-        success = true;
+  std::string font_path;
+  if (font_set) {
+    for (int i = 0; i < font_set->nfont && font_path.empty(); ++i) {
+      FcChar8* file = nullptr;
+      if (FcPatternGetString(font_set->fonts[i], FC_FILE, 0, &file) !=
+          FcResultMatch) {
+        continue;
+      }
+      const char* candidate = reinterpret_cast<const char*>(file);
+      if (!std::filesystem::exists(candidate)) {
+        continue;
+      }
+      // Parse-check the candidate in a throwaway atlas using the default
+      // (small) glyph range to keep this cheap. This performs the same
+      // stb_truetype parsing that the real atlas build will do.
+      ImFontAtlas test_atlas;
+      ImFont* test_font = test_atlas.AddFontFromFileTTF(candidate, font_size);
+      if (!test_font) {
+        continue;
+      }
+      unsigned char* test_pixels = nullptr;
+      int test_width = 0, test_height = 0;
+      test_atlas.GetTexDataAsAlpha8(&test_pixels, &test_width, &test_height);
+      if (test_pixels && test_width > 0 && test_height > 0 &&
+          test_font->IsLoaded()) {
+        font_path = candidate;
+      } else {
+        XELOGW("Skipping font that Dear ImGui cannot parse: {}", candidate);
       }
     }
-    FcPatternDestroy(font);
+    FcFontSetDestroy(font_set);
   }
 
   FcCharSetDestroy(charset);
   FcPatternDestroy(pattern);
   FcConfigDestroy(config);
 
-  if (!success) {
+  if (font_path.empty()) {
     XELOGW(
-        "Unable to find CJK font; Japanese characters may not display "
-        "correctly");
+        "Unable to find loadable CJK font; Japanese characters may not "
+        "display correctly");
+    return false;
   }
-  return success;
+
+  ImFontConfig jp_font_config;
+  jp_font_config.MergeMode = true;
+  jp_font_config.OversampleH = jp_font_config.OversampleV = 2;
+  jp_font_config.PixelSnapH = true;
+
+  io.Fonts->AddFontFromFileTTF(font_path.c_str(), font_size, &jp_font_config,
+                               io.Fonts->GetGlyphRangesJapanese());
+  return true;
 #endif
 
   return false;
@@ -532,6 +559,11 @@ void ImGuiDrawer::SetupFontTexture() {
   unsigned char* pixels;
   int width, height;
   io.Fonts->GetTexDataAsRGBA32(&pixels, &width, &height);
+  if (!pixels || width <= 0 || height <= 0) {
+    XELOGE("Failed to build the font atlas ({}x{}), UI text will not render",
+           width, height);
+    return;
+  }
   font_texture_ = immediate_drawer_->CreateTexture(
       width, height, ImmediateTextureFilter::kLinear, true,
       reinterpret_cast<uint8_t*>(pixels));

@@ -119,6 +119,24 @@ class Backend {
   }
   virtual void FreeGuestTrampoline(uint32_t trampoline_addr) {}
 
+  // Preload cached native code from the AOT cache.
+  // Returns the number of functions preloaded.
+  virtual size_t PreloadAOTCache(Module* module, uint32_t title_id) {
+    return 0;
+  }
+
+  // Flushes pending AOT entries for a single module to disk. Called from
+  // Emulator title-teardown paths BEFORE ~Processor destroys modules_. The
+  // default is a no-op — backends with AOT support override.
+  virtual void FlushAOTCacheForModule(Module* /*module*/,
+                                      uint32_t /*title_id*/) {}
+
+  // Flushes ALL pending AOT entries to disk. Called from Emulator shutdown
+  // BEFORE the kernel_state/processor destructor chain unwinds. BufferedModules
+  // carry the module_hash captured at JIT time — the flush writes valid
+  // .xaot files keyed by executable module SHA. Default is a no-op.
+  virtual void FlushAllPendingAOT() {}
+
  protected:
   Processor* processor_ = nullptr;
   MachineInfo machine_info_;

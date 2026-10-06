@@ -19,6 +19,8 @@ namespace cpu {
 namespace backend {
 namespace x64 {
 
+class X64Backend;
+
 class X64CodeCache : public CodeCacheBase<X64CodeCache> {
  public:
   ~X64CodeCache() override = default;
@@ -26,6 +28,8 @@ class X64CodeCache : public CodeCacheBase<X64CodeCache> {
   static std::unique_ptr<X64CodeCache> Create();
 
   virtual bool Initialize();
+
+  void set_backend(X64Backend* backend) { backend_ = backend; }
 
   void* LookupUnwindInfo(uint64_t host_pc) override { return nullptr; }
 
@@ -46,6 +50,9 @@ class X64CodeCache : public CodeCacheBase<X64CodeCache> {
 
  protected:
   X64CodeCache() = default;
+
+ private:
+  X64Backend* backend_ = nullptr;
 };
 
 }  // namespace x64

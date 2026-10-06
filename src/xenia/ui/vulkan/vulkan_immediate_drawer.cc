@@ -883,6 +883,17 @@ bool VulkanImmediateDrawer::CreateTextureResource(
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
 
+  // Creating an image with empty dimensions is invalid (and segfaults some
+  // drivers, e.g. RADV, instead of returning an error), which can happen if a
+  // font atlas failed to build.
+  if (width == 0 || height == 0) {
+    XELOGE(
+        "VulkanImmediateDrawer: Refusing to create a {}x{} texture with empty "
+        "dimensions",
+        width, height);
+    return false;
+  }
+
   // Create the image and the descriptor.
 
   VkImageCreateInfo image_create_info;

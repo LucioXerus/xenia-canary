@@ -17,12 +17,10 @@
 #include "xenia/ui/windowed_app_context_gtk.h"
 
 int main(int argc_pre_gtk, char** argv_pre_gtk) {
-  // Before touching anything GTK+, make sure that when running on Wayland,
-  // we'll still get an X11 (Xwayland) window
-  // also allow users to override this
-  if (!secure_getenv("GDK_BACKEND")) {
-    setenv("GDK_BACKEND", "x11", 1);
-  }
+  // Let GTK+ pick the display backend itself (native Wayland if a Wayland
+  // compositor is running, X11/Xwayland otherwise) - the app window and the
+  // Vulkan renderer support both. GDK_BACKEND may still be set explicitly to
+  // override the choice.
 
   // Initialize GTK+, which will handle and remove its own arguments from argv.
   // Both GTK+ and Xenia use --option=value argument format (see man

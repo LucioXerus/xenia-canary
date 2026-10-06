@@ -615,6 +615,15 @@ void EmulatorApp::OnDestroy() {
   // Write all cvar overrides to the config.
   config::SaveConfig();
 
+  // AOT: the process terminates below via std::quick_exit(), which does NOT
+  // run destructors, so ~Emulator() never executes. Flush the pending AOT
+  // entries to disk explicitly here, while the emulator (and its
+  // processor/backend) is still alive, otherwise no .xaot files are produced.
+  if (emulator_ && emulator_->processor() &&
+      emulator_->processor()->backend()) {
+    emulator_->processor()->backend()->FlushAllPendingAOT();
+  }
+
   // TODO(DrChat): Remove this code and do a proper exit.
   XELOGI("Cheap-skate exit!");
 

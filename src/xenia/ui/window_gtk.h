@@ -21,6 +21,12 @@
 #include "xenia/ui/menu_item.h"
 #include "xenia/ui/window.h"
 
+// Forward declarations of Wayland types (global namespace, as declared by
+// wayland-client.h).
+struct wl_display;
+struct wl_subcompositor;
+struct wl_surface;
+
 namespace xe {
 namespace ui {
 
@@ -82,6 +88,16 @@ class GTKWindow : public Window {
   GtkWidget* window_ = nullptr;
   GtkWidget* box_ = nullptr;
   GtkWidget* drawing_area_ = nullptr;
+
+  // Binds the Wayland globals Xenia needs itself (currently just the
+  // subcompositor, for giving the Vulkan swapchain its own subsurface - GTK+
+  // renders all widgets into the toplevel surface, which the presenter
+  // cannot share). Only called on a Wayland display, at most once.
+  bool BindWaylandSubcompositor();
+
+  // Owns the bound Wayland subcompositor (the display itself is owned by
+  // GTK+). Null unless running on Wayland and binding succeeded.
+  wl_subcompositor* wayland_subcompositor_ = nullptr;
 
   uint32_t batched_size_update_depth_ = 0;
   bool batched_size_update_contained_configure_ = false;

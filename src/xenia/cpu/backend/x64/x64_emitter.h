@@ -14,6 +14,7 @@
 
 #include "xenia/base/arena.h"
 #include "xenia/cpu/backend/code_cache_base.h"
+#include "xenia/cpu/backend/x64/x64_aot_cache.h"
 #include "xenia/cpu/function.h"
 #include "xenia/cpu/function_trace_data.h"
 #include "xenia/cpu/hir/hir_builder.h"
@@ -213,6 +214,18 @@ class X64Emitter : public Xbyak::CodeGenerator {
   Processor* processor() const { return processor_; }
   X64Backend* backend() const { return backend_; }
 
+  // Per-emitter AOT relocation recorder (NOT shared across threads — fixes the
+  // data race where one global recorder was mutated by concurrent emitters).
+  AOTRecorder& recorder() { return recorder_; }
+
+  // Address of the stackpoint-overflow handler baked (as an abs64 imm) into
+  // every function prolog's overflow tail via CallNativeSafe. Exposed so the
+  // AOT symbol registry can register/relocate it (otherwise every function is
+  // marked uncacheable).
+  static void* stackpoint_overflow_handler_address() {
+    return reinterpret_cast<void*>(&HandleStackpointOverflowError);
+  }
+
   static uintptr_t PlaceConstData();
   static void FreeConstData(uintptr_t data);
 
@@ -329,6 +342,10 @@ class X64Emitter : public Xbyak::CodeGenerator {
 
   XexModule* GuestModule() { return guest_module_; }
 
+  // AOT relocation helpers (no-op when recorder inactive).
+  // seq_memory/sequences register helper rel32 calls via these.
+  void AotRecordHostCallRel32(void* host_fn);
+
   void EmitProfilerEpilogue();
 
   void EmitXOP(amdfx::xop_t xoperation) {
@@ -399,6 +416,7 @@ class X64Emitter : public Xbyak::CodeGenerator {
   X64CodeCache* code_cache_ = nullptr;
   XbyakAllocator* allocator_ = nullptr;
   XexModule* guest_module_ = nullptr;
+  AOTRecorder recorder_;
   bool synchronize_stack_on_next_instruction_ = false;
   Xbyak::util::Cpu cpu_;
   uint64_t feature_flags_ = 0;

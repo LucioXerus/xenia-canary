@@ -481,9 +481,12 @@ std::unique_ptr<HTTPResponseObjectJSON> XLiveAPI::Get(std::string endpoint,
     return PraseResponse(chunk);
   }
 
-  if (timeout > 0) {
-    curl_easy_setopt(curl_handle, CURLOPT_TIMEOUT, timeout);
-  }
+  // Never block the calling thread (often the UI thread during title
+  // launch) indefinitely on an unreachable server. Honor an explicit timeout
+  // when given, otherwise fall back to the same bounds Heartbeat() uses.
+  curl_easy_setopt(curl_handle, CURLOPT_CONNECTTIMEOUT, 5L);
+  curl_easy_setopt(curl_handle, CURLOPT_TIMEOUT,
+                   timeout > 0 ? static_cast<long>(timeout) : 8L);
 
   curl_easy_setopt(curl_handle, CURLOPT_URL, endpoint.c_str());
   curl_easy_setopt(curl_handle, CURLOPT_CUSTOMREQUEST, "GET");
@@ -543,6 +546,10 @@ std::unique_ptr<HTTPResponseObjectJSON> XLiveAPI::Post(std::string endpoint,
   curl_easy_setopt(curl_handle, CURLOPT_CUSTOMREQUEST, "POST");
   curl_easy_setopt(curl_handle, CURLOPT_USERAGENT, "xenia");
   curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDS, data);
+  // Same bounds as Heartbeat() so an unreachable server cannot hang the
+  // calling thread (often the UI thread) indefinitely.
+  curl_easy_setopt(curl_handle, CURLOPT_CONNECTTIMEOUT, 5L);
+  curl_easy_setopt(curl_handle, CURLOPT_TIMEOUT, 8L);
 
   if (data_size > 0) {
     curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDSIZE_LARGE,
@@ -613,6 +620,10 @@ std::unique_ptr<HTTPResponseObjectJSON> XLiveAPI::Delete(std::string endpoint) {
   curl_easy_setopt(curl_handle, CURLOPT_URL, endpoint.c_str());
 
   curl_easy_setopt(curl_handle, CURLOPT_CUSTOMREQUEST, "DELETE");
+  // Same bounds as Heartbeat() so an unreachable server cannot hang the
+  // calling thread indefinitely.
+  curl_easy_setopt(curl_handle, CURLOPT_CONNECTTIMEOUT, 5L);
+  curl_easy_setopt(curl_handle, CURLOPT_TIMEOUT, 8L);
   curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
   curl_easy_setopt(curl_handle, CURLOPT_USERAGENT, "xenia");
 
@@ -669,9 +680,13 @@ std::vector<HTTPResponseObjectJSON> XLiveAPI::GetMulti(
 
     CURL* curl_handle = curl_easy_init();
 
-    if (per_request_timeout > 0) {
-      curl_easy_setopt(curl_handle, CURLOPT_TIMEOUT, per_request_timeout);
-    }
+    // Bound every request so one unreachable host cannot stall the whole
+    // batch. Honor an explicit per-request timeout when given.
+    curl_easy_setopt(curl_handle, CURLOPT_CONNECTTIMEOUT, 5L);
+    curl_easy_setopt(curl_handle, CURLOPT_TIMEOUT,
+                     per_request_timeout > 0
+                         ? static_cast<long>(per_request_timeout)
+                         : 8L);
 
     curl_easy_setopt(curl_handle, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl_handle, CURLOPT_CUSTOMREQUEST, "GET");

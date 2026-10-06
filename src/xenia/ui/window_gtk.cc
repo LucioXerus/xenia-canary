@@ -8,8 +8,11 @@
  */
 
 #include <X11/Xlib-xcb.h>
+#include <gdk/gdkwayland.h>
 #include <gdk/gdkx.h>
 #include <xcb/xcb.h>
+
+#include <cstring>
 
 #include "xenia/base/assert.h"
 #include "xenia/base/logging.h"
@@ -20,6 +23,32 @@
 
 namespace xe {
 namespace ui {
+
+namespace {
+
+// Listener data for binding the Wayland globals Xenia needs itself.
+struct WaylandBindData {
+  wl_subcompositor* subcompositor = nullptr;
+};
+
+void WaylandRegistryGlobalHandler(void* data, wl_registry* registry,
+                                  uint32_t name, const char* interface,
+                                  uint32_t version) {
+  auto* bind_data = static_cast<WaylandBindData*>(data);
+  if (!bind_data->subcompositor &&
+      std::strcmp(interface, wl_subcompositor_interface.name) == 0) {
+    bind_data->subcompositor = static_cast<wl_subcompositor*>(
+        wl_registry_bind(registry, name, &wl_subcompositor_interface, 1));
+  }
+}
+
+void WaylandRegistryGlobalRemoveHandler(void* data, wl_registry* registry,
+                                        uint32_t name) {}
+
+const wl_registry_listener kWaylandBindListener = {
+    WaylandRegistryGlobalHandler, WaylandRegistryGlobalRemoveHandler};
+
+}  // namespace
 
 std::unique_ptr<Window> Window::Create(WindowedAppContext& app_context,
                                        const std::string_view title,
@@ -38,6 +67,10 @@ GTKWindow::GTKWindow(WindowedAppContext& app_context,
 
 GTKWindow::~GTKWindow() {
   EnterDestructor();
+  if (wayland_subcompositor_) {
+    wl_subcompositor_destroy(wayland_subcompositor_);
+    wayland_subcompositor_ = nullptr;
+  }
   if (window_) {
     // Set window_ to null to ignore events from now on since this ui::GTKWindow
     // is entering an indeterminate state.
@@ -50,10 +83,53 @@ GTKWindow::~GTKWindow() {
   }
 }
 
+bool GTKWindow::BindWaylandSubcompositor() {
+  if (wayland_subcompositor_) {
+    return true;
+  }
+  GdkDisplay* display = gtk_widget_get_display(window_);
+  wl_display* wl_display = gdk_wayland_display_get_wl_display(display);
+  if (!wl_display) {
+    XELOGE("GTKWindow: Failed to get the Wayland display");
+    return false;
+  }
+  // Bind our own registry (in addition to GTK+'s) to pick up the
+  // subcompositor global. The round trip also flushes the display connection.
+  wl_registry* registry = wl_display_get_registry(wl_display);
+  if (!registry) {
+    XELOGE("GTKWindow: Failed to get the Wayland registry");
+    return false;
+  }
+  WaylandBindData bind_data;
+  wl_registry_add_listener(registry, &kWaylandBindListener, &bind_data);
+  // A single round trip is enough for the compositor to announce its globals.
+  // This dispatches pending Wayland events on the UI thread, like GTK+ itself
+  // routinely does.
+  if (wl_display_roundtrip(wl_display) < 0) {
+    XELOGE("GTKWindow: Wayland registry round trip failed");
+    wl_registry_destroy(registry);
+    return false;
+  }
+  wl_registry_destroy(registry);
+  if (!bind_data.subcompositor) {
+    XELOGE("GTKWindow: Compositor does not support wl_subcompositor");
+    return false;
+  }
+  wayland_subcompositor_ = bind_data.subcompositor;
+  return true;
+}
+
 bool GTKWindow::OpenImpl() {
   window_ = gtk_window_new(GTK_WINDOW_TOPLEVEL);
 
   gtk_window_set_title(GTK_WINDOW(window_), GetTitle().c_str());
+
+  // Bind the Wayland globals needed for presenting without GTK+ involvement
+  // while the display connection is idle, before any window is shown.
+  GdkDisplay* display = gtk_widget_get_display(window_);
+  if (GDK_IS_WAYLAND_DISPLAY(display)) {
+    BindWaylandSubcompositor();
+  }
 
   // Create the vertical box container for the main menu and the drawing area.
   box_ = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
@@ -71,6 +147,13 @@ bool GTKWindow::OpenImpl() {
   // client area of the window occupying all the window space not taken by the
   // main menu.
   drawing_area_ = gtk_drawing_area_new();
+  // The drawing area is painted externally (by the graphics presenter, e.g.
+  // via a Vulkan swapchain targeting its native surface) - tell GTK+ not to
+  // paint it with Cairo itself. Its software-rendered commits would otherwise
+  // fight the presenter's frames on the same native surface, which kills
+  // Wayland clients using explicit synchronization (e.g. RADV dmabuf
+  // presentation).
+  gtk_widget_set_app_paintable(drawing_area_, TRUE);
   gtk_box_pack_end(GTK_BOX(box_), drawing_area_, true, true, 0);
   // The desired size is the client (drawing) area size. Let GTK auto-size the
   // entire window around it (as well as the width of the menu actually if it
@@ -286,7 +369,64 @@ std::unique_ptr<Surface> GTKWindow::CreateSurfaceImpl(
           gdk_x11_window_get_xid(drawing_area_window));
     }
   }
-  // TODO(Triang3l): Wayland surface.
+  if (allowed_types & Surface::kTypeFlag_WaylandSurface) {
+    type_known = true;
+    if (GDK_IS_WAYLAND_DISPLAY(display) && wayland_subcompositor_) {
+      // GTK+ renders all of its widgets into the toplevel surface, which the
+      // graphics presenter cannot share - interleaving its own buffers with
+      // GTK+'s on one surface kills Wayland clients using explicit
+      // synchronization (e.g. RADV dmabuf presentation). Give the swapchain
+      // its own subsurface positioned exactly over the drawing area instead.
+      // Popup menus get separate surfaces from GTK+ and stay above it.
+      GdkWindow* toplevel_window = gtk_widget_get_window(window_);
+      wl_surface* parent_surface =
+          gdk_wayland_window_get_wl_surface(toplevel_window);
+      if (parent_surface) {
+        // Position of the drawing area within the toplevel widget, in logical
+        // pixels matching the parent surface's coordinate space.
+        gint subsurface_x = 0, subsurface_y = 0;
+        gtk_widget_translate_coordinates(drawing_area_, window_, 0, 0,
+                                         &subsurface_x, &subsurface_y);
+        GtkAllocation drawing_area_allocation;
+        gtk_widget_get_allocation(drawing_area_, &drawing_area_allocation);
+        const gint scale_factor =
+            gdk_window_get_scale_factor(drawing_area_window);
+        wl_display* wl_display = gdk_wayland_display_get_wl_display(display);
+        wl_compositor* compositor =
+            gdk_wayland_display_get_wl_compositor(display);
+        wl_surface* subsurface_surface =
+            compositor ? wl_compositor_create_surface(compositor) : nullptr;
+        if (subsurface_surface) {
+          // Buffers are created at physical pixel size.
+          wl_surface_set_buffer_scale(subsurface_surface, scale_factor);
+          // Empty input region so pointer events fall through to GTK+.
+          wl_region* empty_region = wl_compositor_create_region(compositor);
+          wl_surface_set_input_region(subsurface_surface, empty_region);
+          wl_region_destroy(empty_region);
+          // Opaque region covering the subsurface (in logical pixels) so the
+          // compositor can skip blending it with the parent.
+          wl_region* opaque_region = wl_compositor_create_region(compositor);
+          wl_region_add(opaque_region, 0, 0, drawing_area_allocation.width,
+                        drawing_area_allocation.height);
+          wl_surface_set_opaque_region(subsurface_surface, opaque_region);
+          wl_region_destroy(opaque_region);
+          wl_subsurface* subsurface = wl_subcompositor_get_subsurface(
+              wayland_subcompositor_, subsurface_surface, parent_surface);
+          // Desynchronized so presents apply immediately rather than waiting
+          // for the parent surface's commits.
+          wl_subsurface_set_desync(subsurface);
+          wl_subsurface_set_position(subsurface, subsurface_x, subsurface_y);
+          wl_subsurface_place_above(subsurface, parent_surface);
+          type_supported_by_display = true;
+          return std::make_unique<WaylandSurface>(
+              wl_display, subsurface_surface, subsurface,
+              uint32_t(drawing_area_allocation.width * scale_factor),
+              uint32_t(drawing_area_allocation.height * scale_factor));
+        }
+        XELOGE("GTKWindow: Failed to create a Wayland subsurface");
+      }
+    }
+  }
   if (type_known && !type_supported_by_display) {
     XELOGE(
         "GTKWindow: The window system of the GTK window is not supported by "
