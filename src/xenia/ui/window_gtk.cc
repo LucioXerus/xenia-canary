@@ -10,6 +10,7 @@
 #include <X11/Xlib-xcb.h>
 #include <gdk/gdkwayland.h>
 #include <gdk/gdkx.h>
+#include <wayland-client.h>
 #include <xcb/xcb.h>
 
 #include <cstring>
@@ -205,8 +206,15 @@ bool GTKWindow::OpenImpl() {
 
     GtkAllocation drawing_area_allocation;
     gtk_widget_get_allocation(drawing_area_, &drawing_area_allocation);
-    OnActualSizeUpdate(uint32_t(drawing_area_allocation.width),
-                       uint32_t(drawing_area_allocation.height),
+    gint initial_scale = 1;
+    if (GdkWindow* area_window = gtk_widget_get_window(drawing_area_)) {
+      initial_scale = gdk_window_get_scale_factor(area_window);
+      if (initial_scale < 1) {
+        initial_scale = 1;
+      }
+    }
+    OnActualSizeUpdate(uint32_t(drawing_area_allocation.width * initial_scale),
+                       uint32_t(drawing_area_allocation.height * initial_scale),
                        WindowResizeAction::kManual, destruction_receiver);
     if (destruction_receiver.IsWindowDestroyedOrClosed()) {
       return true;
@@ -437,6 +445,80 @@ std::unique_ptr<Surface> GTKWindow::CreateSurfaceImpl(
 
 void GTKWindow::RequestPaintImpl() { gtk_widget_queue_draw(drawing_area_); }
 
+void GTKWindow::UpdateWaylandSubsurfaceGeometry() {
+  if (!window_ || !drawing_area_) {
+    return;
+  }
+  GdkDisplay* display = gtk_widget_get_display(window_);
+  if (!display || !GDK_IS_WAYLAND_DISPLAY(display)) {
+    return;
+  }
+  Surface* surface = presenter_surface();
+  if (!surface) {
+    return;
+  }
+  auto* wayland_surface = dynamic_cast<WaylandSurface*>(surface);
+  if (!wayland_surface) {
+    return;
+  }
+  wl_surface* wl_subsurface_surface = wayland_surface->surface();
+  wl_subsurface* wl_sub = wayland_surface->subsurface();
+  if (!wl_subsurface_surface || !wl_sub) {
+    return;
+  }
+
+  GdkWindow* area_window = gtk_widget_get_window(drawing_area_);
+  gint scale_factor = 1;
+  if (area_window) {
+    scale_factor = gdk_window_get_scale_factor(area_window);
+    if (scale_factor < 1) {
+      scale_factor = 1;
+    }
+  }
+
+  GtkAllocation drawing_area_allocation;
+  gtk_widget_get_allocation(drawing_area_, &drawing_area_allocation);
+  const gint logical_width =
+      drawing_area_allocation.width > 0 ? drawing_area_allocation.width : 0;
+  const gint logical_height =
+      drawing_area_allocation.height > 0 ? drawing_area_allocation.height : 0;
+
+  // Position of the drawing area within the toplevel widget, in logical
+  // pixels matching the parent surface's coordinate space.
+  gint subsurface_x = 0, subsurface_y = 0;
+  gtk_widget_translate_coordinates(drawing_area_, window_, 0, 0, &subsurface_x,
+                                   &subsurface_y);
+  wl_subsurface_set_position(wl_sub, subsurface_x, subsurface_y);
+
+  // Buffers are created at physical pixel size.
+  wl_surface_set_buffer_scale(wl_subsurface_surface, scale_factor);
+
+  // Opaque region covering the subsurface (in logical pixels) so the
+  // compositor can skip blending it with the parent.
+  if (wl_compositor* compositor =
+          gdk_wayland_display_get_wl_compositor(display)) {
+    if (wl_region* opaque_region = wl_compositor_create_region(compositor)) {
+      if (logical_width > 0 && logical_height > 0) {
+        wl_region_add(opaque_region, 0, 0, logical_width, logical_height);
+      }
+      wl_surface_set_opaque_region(wl_subsurface_surface, opaque_region);
+      wl_region_destroy(opaque_region);
+    }
+  }
+
+  wayland_surface->SetSize(uint32_t(logical_width * scale_factor),
+                           uint32_t(logical_height * scale_factor));
+
+  // Apply the double-buffered geometry immediately, even if no new frame is
+  // presented right away (e.g. position changed while the size stayed the
+  // same, in which case the presenter won't be notified of a resize). The next
+  // Vulkan present will commit the new buffer size anyway.
+  wl_surface_commit(wl_subsurface_surface);
+  if (wl_display* wl_disp = gdk_wayland_display_get_wl_display(display)) {
+    wl_display_flush(wl_disp);
+  }
+}
+
 void GTKWindow::HandleSizeUpdate(
     WindowDestructionReceiver& destruction_receiver) {
   if (!drawing_area_) {
@@ -447,10 +529,27 @@ void GTKWindow::HandleSizeUpdate(
 
   // TODO(Triang3l): Report the desired client area size.
 
+  // On Wayland the Vulkan swapchain renders to a subsurface whose geometry and
+  // cached size must be synchronized before the presenter queries the size to
+  // recreate the swapchain - otherwise the old, possibly fullscreen-sized
+  // buffers keep being presented outside the window bounds.
+  UpdateWaylandSubsurfaceGeometry();
+
   GtkAllocation drawing_area_allocation;
   gtk_widget_get_allocation(drawing_area_, &drawing_area_allocation);
-  OnActualSizeUpdate(uint32_t(drawing_area_allocation.width),
-                     uint32_t(drawing_area_allocation.height),
+  gint scale_factor = 1;
+  if (GdkWindow* area_window = gtk_widget_get_window(drawing_area_)) {
+    scale_factor = gdk_window_get_scale_factor(area_window);
+    if (scale_factor < 1) {
+      scale_factor = 1;
+    }
+  }
+  const gint logical_width =
+      drawing_area_allocation.width > 0 ? drawing_area_allocation.width : 0;
+  const gint logical_height =
+      drawing_area_allocation.height > 0 ? drawing_area_allocation.height : 0;
+  OnActualSizeUpdate(uint32_t(logical_width * scale_factor),
+                     uint32_t(logical_height * scale_factor),
                      WindowResizeAction::kManual, destruction_receiver);
   if (destruction_receiver.IsWindowDestroyedOrClosed()) {
     return;

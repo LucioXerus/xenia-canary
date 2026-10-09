@@ -29,11 +29,11 @@ bool XcbWindowSurface::GetSizeImpl(uint32_t& width_out,
 }
 
 bool WaylandSurface::GetSizeImpl(uint32_t& width_out,
-                                 uint32_t& height_out) const {
+                                  uint32_t& height_out) const {
   // The Wayland protocol has no request for querying a surface's size - the
-  // size tracked from the GTK drawing area allocation when this surface was
-  // opened (and refreshed by reopening the surface on resizes) is
-  // authoritative.
+  // size tracked from the GTK drawing area allocation (kept in sync by
+  // GTKWindow::UpdateWaylandSubsurfaceGeometry on every resize, in physical
+  // pixels) is authoritative.
   width_out = width_;
   height_out = height_;
   return true;

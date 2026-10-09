@@ -56,6 +56,11 @@ class WaylandSurface final : public Surface {
   TypeIndex GetType() const override { return kTypeIndex_WaylandSurface; }
   wl_display* display() const { return display_; }
   wl_surface* surface() const { return surface_; }
+  wl_subsurface* subsurface() const { return subsurface_; }
+  void SetSize(uint32_t width, uint32_t height) {
+    width_ = width;
+    height_ = height;
+  }
 
  protected:
   bool GetSizeImpl(uint32_t& width_out, uint32_t& height_out) const override;

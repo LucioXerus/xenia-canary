@@ -58,6 +58,14 @@ class GTKWindow : public Window {
 
  private:
   void HandleSizeUpdate(WindowDestructionReceiver& destruction_receiver);
+  // Synchronizes the Wayland subsurface geometry (position, opaque region,
+  // buffer scale) and the cached physical size in the WaylandSurface with the
+  // current GTK drawing area allocation. Must be called before reporting a new
+  // size to the common Window / presenter so the swapchain is recreated with
+  // the correct extent. No-op on X11/XCB, without a surface, or if not on
+  // Wayland. Safe to call even if the size hasn't changed (repositions the
+  // subsurface, e.g. after menu changes).
+  void UpdateWaylandSubsurfaceGeometry();
   // For updating multiple factors that may influence the window size at once,
   // without handling the configure event multiple times (that may not only
   // result in wasted handling, but also in the state potentially changed to an
