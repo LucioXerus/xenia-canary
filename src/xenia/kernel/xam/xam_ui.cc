@@ -693,24 +693,6 @@ dword_result_t XamShowPartyUI_entry(dword_t user_index) {
 }
 DECLARE_XAM_EXPORT1(XamShowPartyUI, kUI, kStub);
 
-// this is supposed to do a lot more, calls another function that triggers some
-// cbs
-dword_result_t XamSetDashContext_entry(dword_t value,
-                                       const ppc_context_t& ctx) {
-  ctx->kernel_state->dash_context_ = value;
-  kernel_state()->BroadcastNotification(kXNotificationSystemDashContextChanged,
-                                        0);
-  return 0;
-}
-
-DECLARE_XAM_EXPORT1(XamSetDashContext, kNone, kImplemented);
-
-dword_result_t XamGetDashContext_entry(const ppc_context_t& ctx) {
-  return ctx->kernel_state->dash_context_;
-}
-
-DECLARE_XAM_EXPORT1(XamGetDashContext, kNone, kImplemented);
-
 // https://gitlab.com/GlitchyScripts/xlivelessness/-/blob/master/xlivelessness/xlive/xdefs.hpp?ref_type=heads#L1235
 dword_result_t XamShowMarketplaceUIEx_entry(dword_t user_index, dword_t ui_type,
                                             qword_t offer_id,
