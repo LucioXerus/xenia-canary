@@ -20,8 +20,12 @@
 #include <signal.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
+#if XE_PLATFORM_LINUX
+#include <linux/futex.h>
+#endif
 #include <unistd.h>
 #include <array>
+#include <climits>
 #include <cstddef>
 #include <ctime>
 
@@ -234,6 +238,41 @@ bool SetTlsValue(TlsHandle handle, uintptr_t value) {
   return pthread_setspecific(handle, reinterpret_cast<void*>(value)) == 0;
 }
 
+// A multi-object wait blocks on this counter instead of polling. Every signal
+// bumps it and, on Linux, wakes the waiters with a futex. Neither side takes a
+// lock, so signalling stays safe from a user callback running in a signal
+// handler. With no multi-object wait in progress, signalling is one load.
+std::atomic<uint32_t> multi_wait_epoch{0};
+std::atomic<uint32_t> multi_wait_waiters{0};
+
+void NotifyMultiObjectWaiters() {
+  if (multi_wait_waiters.load(std::memory_order_seq_cst) == 0) {
+    return;
+  }
+  multi_wait_epoch.fetch_add(1, std::memory_order_seq_cst);
+#if XE_PLATFORM_LINUX
+  syscall(SYS_futex, reinterpret_cast<uint32_t*>(&multi_wait_epoch),
+          FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0);
+#endif
+}
+
+// Blocks until the epoch differs from `expected` or `timeout` passes.
+void WaitForMultiObjectSignal(uint32_t expected,
+                              std::chrono::milliseconds timeout) {
+#if XE_PLATFORM_LINUX
+  timespec ts{};
+  ts.tv_sec = static_cast<time_t>(timeout.count() / 1000);
+  ts.tv_nsec = static_cast<long>((timeout.count() % 1000) * 1000000);
+  syscall(SYS_futex, reinterpret_cast<uint32_t*>(&multi_wait_epoch),
+          FUTEX_WAIT_PRIVATE, expected, &ts, nullptr, 0);
+#else
+  if (multi_wait_epoch.load(std::memory_order_seq_cst) == expected) {
+    std::this_thread::sleep_for(
+        std::min(timeout, std::chrono::milliseconds(1)));
+  }
+#endif
+}
+
 class PosixConditionBase {
  public:
   PosixConditionBase() {
@@ -296,15 +335,26 @@ class PosixConditionBase {
       return std::make_pair(result, 0);
     }
 
-    // For multiple handles, we need to poll since we can't wait on multiple
-    // condition variables simultaneously. This is a limitation of the POSIX
-    // condition variable API.
+    // Check the handles in turn and block on the multi-object epoch between
+    // checks.
     auto start_time = std::chrono::steady_clock::now();
     auto end_time = (timeout == std::chrono::milliseconds::max())
                         ? std::chrono::steady_clock::time_point::max()
                         : start_time + timeout;
 
+    // Registered before the first check, so a later signal bumps the epoch.
+    multi_wait_waiters.fetch_add(1, std::memory_order_seq_cst);
+    struct MultiWaitRegistration {
+      ~MultiWaitRegistration() {
+        multi_wait_waiters.fetch_sub(1, std::memory_order_seq_cst);
+      }
+    } multi_wait_registration;
     while (true) {
+      // A signal while the handles are read changes the epoch, and the wait
+      // below then returns at once.
+      uint32_t epoch_before_check =
+          multi_wait_epoch.load(std::memory_order_seq_cst);
+
       // Check all handles to see if any/all are signaled
       // Use try_lock to avoid deadlocks from lock ordering issues
       size_t first_signaled = std::numeric_limits<size_t>::max();
@@ -388,11 +438,11 @@ class PosixConditionBase {
         return std::make_pair<WaitResult, size_t>(WaitResult::kTimeout, 0);
       }
 
-      // Sleep for a short time before polling again
       auto remaining =
           std::chrono::duration_cast<std::chrono::milliseconds>(end_time - now);
-      auto sleep_time = std::min(remaining, std::chrono::milliseconds(1));
-      std::this_thread::sleep_for(sleep_time);
+      WaitForMultiObjectSignal(
+          epoch_before_check,
+          std::min(remaining, std::chrono::milliseconds(50)));
     }
   }
 
@@ -425,12 +475,19 @@ class PosixCondition<Event> : public PosixConditionBase {
     auto lock = std::unique_lock(mutex_);
     signal_ = true;
     cond_.notify_all();
+    NotifyMultiObjectWaiters();
     return true;
   }
 
   void Reset() {
     auto lock = std::unique_lock(mutex_);
     signal_ = false;
+  }
+
+  EventInfo Query() {
+    auto lock = std::unique_lock(mutex_);
+    // EVENT_TYPE: NotificationEvent = 0, SynchronizationEvent = 1.
+    return EventInfo{manual_reset_ ? 0u : 1u, signal_ ? 1u : 0u};
   }
 
  private:
@@ -463,6 +520,7 @@ class PosixCondition<Semaphore> final : public PosixConditionBase {
     }
     count_ += release_count;
     cond_.notify_all();
+    NotifyMultiObjectWaiters();
     return true;
   }
 
@@ -471,6 +529,7 @@ class PosixCondition<Semaphore> final : public PosixConditionBase {
   void post_execution() override {
     count_--;
     cond_.notify_all();
+    NotifyMultiObjectWaiters();
   }
   uint32_t count_;
   const uint32_t maximum_count_;
@@ -495,6 +554,7 @@ class PosixCondition<Mutant> final : public PosixConditionBase {
       // Free to be acquired by another thread
       if (count_ == 0) {
         cond_.notify_all();
+        NotifyMultiObjectWaiters();
       }
       return true;
     }
@@ -529,6 +589,7 @@ class PosixCondition<Timer> final : public PosixConditionBase {
     std::lock_guard lock(mutex_);
     signal_ = true;
     cond_.notify_all();
+    NotifyMultiObjectWaiters();
     return true;
   }
 
@@ -954,6 +1015,7 @@ class PosixCondition<Thread> final : public PosixConditionBase {
       exit_code_ = exit_code;
       signaled_ = true;
       cond_.notify_all();
+      NotifyMultiObjectWaiters();
     }
     if (is_current_thread) {
       pthread_exit(reinterpret_cast<void*>(exit_code));
@@ -1162,11 +1224,7 @@ class PosixEvent final : public PosixConditionHandle<Event> {
   ~PosixEvent() override = default;
   void Set() override { handle_.Signal(); }
   void Reset() override { handle_.Reset(); }
-  EventInfo Query() override {
-    EventInfo result{};
-    assert_always();
-    return result;
-  }
+  EventInfo Query() override { return handle_.Query(); }
   void Pulse() override {
     using namespace std::chrono_literals;
     handle_.Signal();
@@ -1351,14 +1409,16 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
     std::unique_lock lock(thread->handle_.state_mutex_);
     thread->handle_.state_ =
         create_suspended ? State::kSuspended : State::kRunning;
+    // Set the initial suspend count before Resume can pass WaitStarted.
+    if (create_suspended) {
+      thread->handle_.suspend_count_ = 1;
+    }
     thread->handle_.state_signal_.notify_all();
   }
 
   if (create_suspended) {
-    std::unique_lock lock(thread->handle_.state_mutex_);
-    thread->handle_.suspend_count_ = 1;
-    thread->handle_.state_signal_.wait(
-        lock, [thread] { return thread->handle_.suspend_count_ == 0; });
+    // Wait on the semaphore Resume posts when the suspend count reaches zero.
+    thread->handle_.WaitSuspended();
   }
 
   start_routine();
@@ -1373,6 +1433,7 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
     thread->handle_.exit_code_ = 0;
     thread->handle_.signaled_ = true;
     thread->handle_.cond_.notify_all();
+    NotifyMultiObjectWaiters();
   }
 
   current_thread_ = nullptr;

@@ -12,6 +12,12 @@
 DEFINE_path(trace_gpu_prefix, "scratch/gpu/",
             "Prefix path for GPU trace files.", "GPU.Debug");
 DEFINE_bool(trace_gpu_stream, false, "Trace all GPU packets.", "GPU.Debug");
+DEFINE_string(trace_gpu_frames, "",
+              "Comma-separated frame numbers to capture as single frame GPU "
+              "traces, the same way as a manual frame trace request, for "
+              "example \"300,1200\". Frames are counted by the swaps "
+              "before them, and each trace is named after its frame number.",
+              "GPU.Debug");
 
 DEFINE_path(
     dump_shaders, "",
@@ -119,3 +125,11 @@ DEFINE_bool(
     "This rounding behavior hasn't been confirmed on real hardware, so it's "
     "disabled by default.",
     "GPU");
+
+DEFINE_bool(xenos_sample_positions, false,
+            "Rasterize 2x and 4x MSAA render targets at the Xenos sample "
+            "positions, like real hardware, if the GPU and driver support it.\n"
+            "Only applies to RTV/FBO - ROV/FSI render targets always use Xenos "
+            "positions since they safely map coverage and calculate depth "
+            "in-shader.",
+            "GPU");

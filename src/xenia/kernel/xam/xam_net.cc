@@ -26,6 +26,7 @@
 #include "xenia/kernel/xam/xam_net.h"
 #include "xenia/kernel/xam/xam_private.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_error.h"
+#include "xenia/kernel/xboxkrnl/xboxkrnl_memory.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_modules.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_threading.h"
 #include "xenia/kernel/xevent.h"
@@ -142,6 +143,7 @@ struct X_WSADATA {
   xe::be<uint32_t> vendor_info_ptr;
 };
 static_assert_size(X_WSADATA, 0x190);
+
 
 // https://github.com/joolswills/mameox/blob/master/MAMEoX/Sources/xbox_Network.cpp#L136
 struct XNetStartupParams {

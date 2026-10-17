@@ -12,6 +12,7 @@
 
 #include <map>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <string>
 #include <unordered_map>
@@ -240,6 +241,7 @@ class UserProfile {
   GpdInfoProfile dashboard_gpd_;
   std::map<uint32_t, GpdInfoTitle> games_gpd_;
   std::vector<Property> properties_;  // Includes contexts!
+  std::mutex prop_mutex;              // 5841089C
 
   std::vector<X_ONLINE_FRIEND> friends_;
   std::mutex friends_mutex_;

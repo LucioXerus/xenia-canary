@@ -893,6 +893,8 @@ void UserTracker::AddProperty(const uint64_t xuid, const Property* property) {
     }
   }
 
+  std::lock_guard prop_lock(user->prop_mutex);
+
   auto entry = std::ranges::find_if(
       user->properties_, [property_id](const Property& property_data) {
         return property_data.GetPropertyId().value == property_id.value;
@@ -915,6 +917,8 @@ X_STATUS UserTracker::GetProperty(const uint64_t xuid, uint32_t* property_size,
 
   *property_size = 0;
   const auto& property_id = property->property_id;
+
+  std::lock_guard prop_lock(user->prop_mutex);
 
   const auto entry = std::ranges::find_if(
       std::as_const(user->properties_),
@@ -943,6 +947,8 @@ const Property* UserTracker::GetProperty(const uint64_t xuid,
   if (!user) {
     return nullptr;
   }
+
+  std::lock_guard prop_lock(user->prop_mutex);
 
   const auto entry = std::ranges::find_if(
       std::as_const(user->properties_), [id](const Property& property_data) {
@@ -1068,6 +1074,8 @@ void UserTracker::UpdateContext(uint64_t xuid, uint32_t id, uint32_t value) {
     return;
   }
 
+  std::lock_guard prop_lock(user->prop_mutex);
+
   const auto entry = std::ranges::find_if(
       user->properties_, [id](const Property& property_data) {
         return property_data.IsContext() &&
@@ -1097,6 +1105,8 @@ std::optional<uint32_t> UserTracker::GetUserContext(uint64_t xuid,
   if (!context_data) {
     return std::nullopt;
   }
+
+  std::lock_guard prop_lock(user->prop_mutex);
 
   const auto entry = std::ranges::find_if(
       std::as_const(user->properties_), [id](const Property& property_data) {
@@ -1141,6 +1151,8 @@ std::vector<AttributeKey> UserTracker::GetUserContextIds(uint64_t xuid) const {
 
   std::vector<AttributeKey> entries;
 
+  std::lock_guard prop_lock(user->prop_mutex);
+
   for (const auto& property : user->properties_) {
     if (!property.IsContext()) {
       continue;
@@ -1160,6 +1172,8 @@ std::vector<AttributeKey> UserTracker::GetUserPropertyIds(uint64_t xuid) const {
   if (!user) {
     return {};
   }
+
+  std::lock_guard prop_lock(user->prop_mutex);
 
   std::vector<AttributeKey> entries;
 

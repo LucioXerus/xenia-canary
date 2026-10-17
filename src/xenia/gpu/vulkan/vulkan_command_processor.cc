@@ -39,6 +39,14 @@
 DECLARE_bool(clear_memory_page_state);
 DECLARE_bool(readback_resolve_half_pixel_offset);
 
+DEFINE_bool(vulkan_depth_bias_force_unorm, true,
+            "Apply the depth bias in constant units on float depth buffers "
+            "where VK_EXT_depth_bias_control supports it, so the bias keeps "
+            "its absolute size at every depth. Otherwise, the bias unit of a "
+            "float depth buffer shrinks with the depth, and decals may "
+            "Z-fight, especially with reversed depth.",
+            "Vulkan");
+
 namespace xe {
 namespace gpu {
 namespace vulkan {
@@ -1870,7 +1878,7 @@ bool VulkanCommandProcessor::PushImageMemoryBarrier(
     VkAccessFlags src_access_mask, VkAccessFlags dst_access_mask,
     VkImageLayout old_layout, VkImageLayout new_layout,
     uint32_t src_queue_family_index, uint32_t dst_queue_family_index,
-    bool skip_if_equal) {
+    bool skip_if_equal, const VkSampleLocationsInfoEXT* sample_locations) {
   if (skip_if_equal && src_stage_mask == dst_stage_mask &&
       src_access_mask == dst_access_mask && old_layout == new_layout &&
       src_queue_family_index == dst_queue_family_index) {
@@ -1902,7 +1910,8 @@ bool VulkanCommandProcessor::PushImageMemoryBarrier(
              subresource_range.baseArrayLayer)) {
       continue;
     }
-    if (other_image_memory_barrier.subresourceRange.aspectMask ==
+    if (other_image_memory_barrier.pNext == sample_locations &&
+        other_image_memory_barrier.subresourceRange.aspectMask ==
             subresource_range.aspectMask &&
         other_image_memory_barrier.subresourceRange.baseMipLevel ==
             subresource_range.baseMipLevel &&
@@ -1934,7 +1943,7 @@ bool VulkanCommandProcessor::PushImageMemoryBarrier(
   VkImageMemoryBarrier& image_memory_barrier =
       pending_barriers_image_memory_barriers_.emplace_back();
   image_memory_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-  image_memory_barrier.pNext = nullptr;
+  image_memory_barrier.pNext = sample_locations;
   image_memory_barrier.srcAccessMask = src_access_mask;
   image_memory_barrier.dstAccessMask = dst_access_mask;
   image_memory_barrier.oldLayout = old_layout;
@@ -2019,8 +2028,15 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
   render_pass_begin_info.renderArea.extent = framebuffer->host_extent;
   render_pass_begin_info.clearValueCount = 0;
   render_pass_begin_info.pClearValues = nullptr;
-  deferred_command_buffer_.CmdVkBeginRenderPass(&render_pass_begin_info,
-                                                VK_SUBPASS_CONTENTS_INLINE);
+  // The sample locations for automatic depth layout transitions and for the
+  // subpass rasterization state when variableSampleLocations is false.
+  deferred_command_buffer_.CmdVkBeginRenderPass(
+      &render_pass_begin_info, VK_SUBPASS_CONTENTS_INLINE,
+      framebuffer->render_pass_key.depth_and_color_used
+          ? render_target_cache_->GetSampleLocationsInfo(
+                framebuffer->render_pass_key.msaa_samples, true)
+          : nullptr,
+      (framebuffer->render_pass_key.depth_and_color_used & 1) != 0);
 
   // Resume any pending ZPD segment now that the pass is open.
   OpenQuerySegment(false);
@@ -2677,13 +2693,14 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   // Create the pipeline (for this, need the render pass from the render target
   // cache), translating the shaders - doing this now to obtain the used
   // textures.
+  VulkanRenderTargetCache::RenderPassKey render_pass_key =
+      render_target_cache_->last_update_render_pass_key();
   VulkanPipelineCache::Pipeline* pipeline;
   if (!pipeline_cache_->ConfigurePipeline(
           vertex_shader_translation, pixel_shader_translation,
           primitive_processing_result, normalized_depth_control,
-          normalized_color_mask,
-          render_target_cache_->last_update_render_pass_key(), zpd_hybrid,
-          viz_survey, &pipeline)) {
+          normalized_color_mask, render_pass_key, zpd_hybrid, viz_survey,
+          &pipeline)) {
     return false;
   }
 
@@ -2810,7 +2827,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
       normalized_depth_control,
       host_render_targets_used &&
           render_target_cache_->depth_float24_convert_in_pixel_shader(),
-      host_render_targets_used, pixel_shader && pixel_shader->writes_depth());
+      host_render_targets_used, pixel_shader && pixel_shader->writes_depth(),
+      !host_render_targets_used ||
+          render_target_cache_->GetSampleLocationsInfo(
+              render_pass_key.msaa_samples,
+              render_pass_key.depth_and_color_used) != nullptr);
   gviargs.SetupRegisterValues(regs, window_offset_tiles != 0);
 
   draw_util::GetHostViewportInfo(&gviargs, viewport_info);
@@ -4837,6 +4858,13 @@ void VulkanCommandProcessor::UpdateDynamicState(
   if (render_target_cache_->GetPath() ==
       RenderTargetCache::Path::kHostRenderTargets) {
     // Depth bias.
+    const ui::vulkan::VulkanDevice::Properties& device_properties =
+        GetVulkanDevice()->properties();
+    const bool depth_bias_force_unorm =
+        cvars::vulkan_depth_bias_force_unorm &&
+        device_properties.depthBiasControl &&
+        device_properties.leastRepresentableValueForceUnormRepresentation &&
+        device_properties.depthBiasExact;
     float depth_bias_constant_factor, depth_bias_slope_factor;
     if (depth_bias_in_pixel_shader) {
       depth_bias_constant_factor = 0.0f;
@@ -4845,11 +4873,16 @@ void VulkanCommandProcessor::UpdateDynamicState(
       draw_util::GetPreferredFacePolygonOffset(regs, primitive_polygonal,
                                                depth_bias_slope_factor,
                                                depth_bias_constant_factor);
+      const bool depth_float24 = regs.Get<reg::RB_DEPTH_INFO>().depth_format ==
+                                 xenos::DepthRenderTargetFormat::kD24FS8;
       depth_bias_constant_factor *=
-          regs.Get<reg::RB_DEPTH_INFO>().depth_format ==
-                  xenos::DepthRenderTargetFormat::kD24S8
-              ? draw_util::kD3D10PolygonOffsetFactorUnorm24
-              : draw_util::kD3D10PolygonOffsetFactorFloat24;
+          depth_float24 ? draw_util::kD3D10PolygonOffsetFactorFloat24
+                        : draw_util::kD3D10PolygonOffsetFactorUnorm24;
+      if (depth_bias_force_unorm && depth_float24) {
+        // With a constant bias unit, the host 0...0.5 depth range no longer
+        // lowers the exponent (see kD3D10PolygonOffsetFactorFloat24).
+        depth_bias_constant_factor *= 0.5f;
+      }
       // With non-square resolution scaling, make sure the worst-case impact is
       // reverted (slope only along the scaled axis), thus max. More bias is
       // better than less bias, because less bias means Z fighting with the
@@ -4870,9 +4903,17 @@ void VulkanCommandProcessor::UpdateDynamicState(
     if (dynamic_depth_bias_update_needed_) {
       dynamic_depth_bias_constant_factor_ = depth_bias_constant_factor;
       dynamic_depth_bias_slope_factor_ = depth_bias_slope_factor;
-      deferred_command_buffer_.CmdVkSetDepthBias(
-          dynamic_depth_bias_constant_factor_, 0.0f,
-          dynamic_depth_bias_slope_factor_);
+      if (depth_bias_force_unorm) {
+        deferred_command_buffer_.CmdVkSetDepthBias2EXT(
+            dynamic_depth_bias_constant_factor_, 0.0f,
+            dynamic_depth_bias_slope_factor_,
+            VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORCE_UNORM_EXT,
+            true);
+      } else {
+        deferred_command_buffer_.CmdVkSetDepthBias(
+            dynamic_depth_bias_constant_factor_, 0.0f,
+            dynamic_depth_bias_slope_factor_);
+      }
       dynamic_depth_bias_update_needed_ = false;
     }
 
