@@ -10,6 +10,7 @@
 #ifndef XENIA_KERNEL_UTIL_OBJECT_TABLE_H_
 #define XENIA_KERNEL_UTIL_OBJECT_TABLE_H_
 
+#include <atomic>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -86,8 +87,13 @@ class ObjectTable {
  private:
   struct ObjectTableEntry {
     int handle_ref_count = 0;
+    // Accessed atomically (__atomic_* on this address) in the lock-free
+    // LookupObject() path; ordinary accesses below happen under the global
+    // critical region, except for read-only ones that are never concurrent
+    // with a change to the same entry.
     XObject* object = nullptr;
   };
+  void RetireArray(ObjectTableEntry* array);
   ObjectTableEntry* LookupTableInLock(X_HANDLE handle);
   ObjectTableEntry* LookupTable(X_HANDLE handle);
   XObject* LookupObject(X_HANDLE handle, bool already_locked);
@@ -103,6 +109,9 @@ class ObjectTable {
   bool Resize(uint32_t new_capacity, bool host);
 
   xe::global_critical_region global_critical_region_;
+  // Written under the global critical region only. Reads of handle entries in
+  // LookupObject() are lock-free, hence the atomics (see the publishing
+  // protocol documented there and in Resize()).
   uint32_t table_capacity_ = 0;
   uint32_t host_table_capacity_ = 0;
   ObjectTableEntry* table_ = nullptr;
