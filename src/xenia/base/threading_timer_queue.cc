@@ -42,7 +42,20 @@ using WaitItem = TimerQueueWaitItem;
     edit2: (30.12.2024) After uplifting version of MSVC compiler Xenia cannot be
    correctly initialized if you're using proton.
 */
-using WaitStrat = dp::spin_wait_strategy;
+
+/*
+    edit3: (19.10.2026) The blocking wait is re-enabled. The reason it was
+   reverted (disruptorplus passing bad arguments to
+   condition_variable::wait_until) is long fixed: wait_until_published() now
+   uses the 3-argument predicate form, and signal_all_when_blocking() takes the
+   mutex before notifying, so publishers do wake the dispatch thread.
+   Profiling (BO2 MP, ~700k samples) showed TimerThreadMain spending 3.74% of
+   all process CPU here: the spin strategy busy-polls forever, so an idle timer
+   queue still pins a core. This thread only wakes when a timer is queued or
+   the earliest due_ is reached, which is exactly what a condition variable
+   does for free.
+*/
+using WaitStrat = dp::blocking_wait_strategy;
 
 class TimerQueue {
  public:
