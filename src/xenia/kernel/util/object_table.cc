@@ -55,8 +55,11 @@ void ObjectTable::Reset() {
                    __ATOMIC_RELEASE);
   __atomic_store_n(&host_table_, static_cast<ObjectTableEntry*>(nullptr),
                    __ATOMIC_RELEASE);
-  table_capacity_ = 0;
-  host_table_capacity_ = 0;
+  // Publish the zero capacities with release as well: lookups pair these with
+  // acquire loads, and a reader that observed a nonzero capacity but a null
+  // array must not index it (both LookupObject() branches guard against null).
+  __atomic_store_n(&table_capacity_, 0u, __ATOMIC_RELEASE);
+  __atomic_store_n(&host_table_capacity_, 0u, __ATOMIC_RELEASE);
   last_free_entry_ = 0;
   last_free_host_entry_ = 0;
 }
@@ -246,7 +249,11 @@ X_STATUS ObjectTable::RemoveHandle(X_HANDLE handle) {
 
   if (entry->object) {
     auto object = entry->object;
-    entry->object = nullptr;
+    // Release store: LookupObject() reads the field lock-free, and on a
+    // weakly-ordered target the clearing of the pointer must be published
+    // before the object can be destroyed by the Release() below.
+    __atomic_store_n(&entry->object, static_cast<XObject*>(nullptr),
+                     __ATOMIC_RELEASE);
     assert_zero(entry->handle_ref_count);
     entry->handle_ref_count = 0;
 
@@ -360,6 +367,9 @@ XObject* ObjectTable::LookupObject(X_HANDLE handle, bool already_locked) {
       return nullptr;
     }
     entries = __atomic_load_n(&host_table_, __ATOMIC_ACQUIRE);
+    if (!entries) {
+      return nullptr;
+    }
   } else {
     capacity = __atomic_load_n(&table_capacity_, __ATOMIC_ACQUIRE);
     if (slot >= capacity) {
