@@ -22,28 +22,95 @@ ObjectTable::ObjectTable() {}
 
 ObjectTable::~ObjectTable() { Reset(); }
 
+ObjectTable::ReaderShard ObjectTable::shards_[ObjectTable::kReaderShardCount];
+
+static uint32_t PickReaderShard() {
+  // Resolved once per thread. Only performance depends on the choice: shards
+  // hold per-thread counters that add up, so a collision costs a shared cache
+  // line, not correctness. threading::current_thread_id() cannot be used here
+  // because Xenia replaces it with the guest handle once a guest thread runs.
+  static const thread_local uint32_t shard = [] {
+    const auto tid = std::hash<std::thread::id>()(std::this_thread::get_id());
+    return static_cast<uint32_t>((tid >> 5) ^ (tid >> 13)) &
+           (ObjectTable::kReaderShardCount - 1);
+  }();
+  return shard;
+}
+
+bool ObjectTable::AnyReaderActive() {
+  for (uint32_t i = 0; i < kReaderShardCount; ++i) {
+    if (shards_[i].active.load(std::memory_order_relaxed)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void ObjectTable::DropTableReference(XObject* object) {
+  // The object is already gone from its entry, so no lookup started from here
+  // on can reach it. One that is mid-lookup may still be about to retain it,
+  // though, so check for that first: the common case allocates nothing.
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+  if (!AnyReaderActive()) {
+    object->Release();
+    // A lookup that just finished may have been the last one holding up a
+    // parked reference.
+    ReclaimRetired();
+    return;
+  }
+  retired_ = new RetiredObject{retired_, object};
+  ReclaimRetired();
+}
+
+void ObjectTable::ReclaimRetired() {
+  if (!retired_) {
+    return;
+  }
+  // Pairs with the fence in BeginLookup(): a lookup that announced itself
+  // before its entry was emptied must have finished before anything it may
+  // reach is released.
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+  if (AnyReaderActive()) {
+    // A lookup is in flight. The next retirement re-checks.
+    return;
+  }
+  RetiredObject* entry = retired_;
+  retired_ = nullptr;
+  while (entry) {
+    RetiredObject* next = entry->next;
+    entry->object->Release();
+    delete entry;
+    entry = next;
+  }
+}
+
 void ObjectTable::Reset() {
   auto global_lock = global_critical_region_.Acquire();
 
   // Release all objects, clearing their handles first so destructors
-  // don't assert on non-empty handles_.
+  // don't assert on non-empty handles_. The references go through
+  // DropTableReference(), since a lookup may be about to retain one.
   for (uint32_t n = 0; n < table_capacity_; n++) {
     ObjectTableEntry& entry = table_[n];
     if (entry.object) {
-      entry.object->handles().clear();
+      XObject* object = entry.object;
+      object->handles().clear();
       entry.handle_ref_count = 0;
-      entry.object->Release();
+      __atomic_store_n(&entry.object, static_cast<XObject*>(nullptr),
+                       __ATOMIC_RELEASE);
+      DropTableReference(object);
     }
-    __atomic_store_n(&entry.object, nullptr, __ATOMIC_RELEASE);
   }
   for (uint32_t n = 0; n < host_table_capacity_; n++) {
     ObjectTableEntry& entry = host_table_[n];
     if (entry.object) {
-      entry.object->handles().clear();
+      XObject* object = entry.object;
+      object->handles().clear();
       entry.handle_ref_count = 0;
-      entry.object->Release();
+      __atomic_store_n(&entry.object, static_cast<XObject*>(nullptr),
+                       __ATOMIC_RELEASE);
+      DropTableReference(object);
     }
-    __atomic_store_n(&entry.object, nullptr, __ATOMIC_RELEASE);
   }
 
   // Lookups are lock-free, so a thread may still be indexing the old array
@@ -62,6 +129,7 @@ void ObjectTable::Reset() {
   __atomic_store_n(&host_table_capacity_, 0u, __ATOMIC_RELEASE);
   last_free_entry_ = 0;
   last_free_host_entry_ = 0;
+  ReclaimRetired();
 }
 
 // Retires an array replaced by Resize() or Reset().
@@ -149,6 +217,10 @@ X_STATUS ObjectTable::AddHandle(XObject* object, X_HANDLE* out_handle) {
   uint32_t handle = 0;
   {
     auto global_lock = global_critical_region_.Acquire();
+
+    // A retirement can be left parked by a lookup that was in flight; handle
+    // creation is frequent, so use it to retry.
+    ReclaimRetired();
 
     // Find a free slot.
     uint32_t slot = 0;
@@ -269,8 +341,9 @@ X_STATUS ObjectTable::RemoveHandle(X_HANDLE handle) {
     if (!object->name().empty()) {
       RemoveNameMapping(object->name());
     }
-    // Release now that the object has been removed from the table.
-    object->Release();
+    // Release now that the object has been removed from the table. Deferred:
+    // a lock-free lookup may still be about to retain it.
+    DropTableReference(object);
   }
 
   return X_STATUS_SUCCESS;
@@ -305,10 +378,15 @@ void ObjectTable::PurgeAllObjects() {
   for (uint32_t slot = 0; slot < table_capacity_; slot++) {
     auto& entry = table_[slot];
     if (entry.object) {
+      XObject* object = entry.object;
       entry.handle_ref_count = 0;
-      entry.object->ReleaseHandle();
+      object->ReleaseHandle();
 
-      __atomic_store_n(&entry.object, nullptr, __ATOMIC_RELEASE);
+      __atomic_store_n(&entry.object, static_cast<XObject*>(nullptr),
+                       __ATOMIC_RELEASE);
+      // ReleaseHandle() drops the handle reference; the table still owns one,
+      // which is dropped only after the entry is empty.
+      DropTableReference(object);
     }
   }
 }
@@ -387,8 +465,8 @@ XObject* ObjectTable::LookupObject(X_HANDLE handle, bool already_locked) {
 
   // Handle lookups are the single hottest kernel operation (every wait, read,
   // write and signal is addressed by handle), so this is a lock-free lookup:
-  // take a pointer reference on the target before touching it, then check that
-  // the entry still refers to that object.
+  // take a reference on the target before touching it, then check that the
+  // entry still refers to that object.
   //
   // This is only safe because an entry's object pointer is never replaced
   // while it is non-null: CloseHandle clears it under the global lock, and the
@@ -400,21 +478,26 @@ XObject* ObjectTable::LookupObject(X_HANDLE handle, bool already_locked) {
   //    cleared, so a non-null pointer can always be dereferenced;
   //  - if we observed the pointer before it was cleared, Retain() still keeps
   //    the object alive even if the clearing thread drops the table's
-  //    reference concurrently;
+  //    reference concurrently - which is why that drop is deferred: see
+  //    DropTableReference(). Announcing the lookup here is what lets the
+  //    table know this may be happening, and the fence in BeginLookup()
+  //    orders the announcement before the load below;
   //  - the re-check below rejects the case where the slot was cleared and
   //    reused by a different object between the load and the Retain.
+  ReaderShard* shard = &shards_[PickReaderShard()];
+  BeginLookup(shard);
   object = __atomic_load_n(&entries[slot].object, __ATOMIC_ACQUIRE);
-  if (!object) {
-    return nullptr;
+  if (object) {
+    object->Retain();
+    if (XE_UNLIKELY(__atomic_load_n(&entries[slot].object, __ATOMIC_ACQUIRE) !=
+                    object)) {
+      // Closed and the slot was reused while we were retaining: this handle
+      // now refers to a different object.
+      object->Release();
+      object = nullptr;
+    }
   }
-  object->Retain();
-  if (XE_UNLIKELY(__atomic_load_n(&entries[slot].object, __ATOMIC_ACQUIRE) !=
-                  object)) {
-    // Closed and the slot was reused while we were retaining: this handle now
-    // refers to a different object.
-    object->Release();
-    return nullptr;
-  }
+  EndLookup(shard);
 
   return object;
 }
