@@ -326,11 +326,15 @@ ObjectTable::ObjectTableEntry* ObjectTable::LookupTableInLock(X_HANDLE handle) {
 
   const bool is_host_object = XObject::is_handle_host_object(handle);
   uint32_t slot = GetHandleSlot(handle, is_host_object);
+  // Bound the slot with '<': table_capacity_ is the *count* of entries, so the
+  // last valid index is capacity - 1. A handle crafted by the guest with
+  // slot == capacity previously returned a pointer one past the end of the
+  // array, which ReleaseHandle()/RetainHandle() then read and wrote through.
   if (is_host_object) {
-    if (slot <= host_table_capacity_) {
+    if (slot < host_table_capacity_) {
       return &host_table_[slot];
     }
-  } else if (slot <= table_capacity_) {
+  } else if (slot < table_capacity_) {
     return &table_[slot];
   }
 
