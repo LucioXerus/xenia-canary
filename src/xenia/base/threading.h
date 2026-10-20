@@ -244,21 +244,11 @@ enum class WaitResult {
 
 class WaitHandle {
  public:
-  // Identifies the platform implementation family of this handle so that
-  // cross-casts to implementation interfaces (which may be virtual bases) can
-  // be avoided on the hot wait path.
-  enum class HandleType : uint8_t {
-    kNone,
-    kPosix,
-  };
-
   virtual ~WaitHandle() = default;
 
   // Returns the native handle of the object on the host system.
   // This value is platform specific.
   virtual void* native_handle() const = 0;
-
-  virtual HandleType handle_type() const { return HandleType::kNone; }
 
  protected:
   WaitHandle() = default;

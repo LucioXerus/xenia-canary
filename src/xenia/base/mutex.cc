@@ -13,10 +13,8 @@
 #elif XE_PLATFORM_LINUX == 1
 #include <linux/futex.h>
 #include <pthread.h>
-#include <sched.h>
 #include <sys/syscall.h>
 #include <unistd.h>
-#include <time.h>
 #endif
 
 namespace xe {
@@ -91,140 +89,103 @@ inline int futex_wake(std::atomic<uint32_t>* addr, int count) {
                  0);
 }
 
-inline int futex_wait_timeout(std::atomic<uint32_t>* addr, uint32_t expected,
-                              const struct timespec* timeout) {
-  return syscall(SYS_futex, addr, FUTEX_WAIT_PRIVATE, expected, timeout,
-                 nullptr, 0);
+// Only compared for equality, to detect the owner re-entering.
+inline uint64_t xe_current_thread_id() {
+  return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(pthread_self()));
 }
-
-// Blocked before this many times: this is a "cheap" wake (the owner will
-// release soon, or the guest thread will be scheduled again soon), so spin
-// without sleeping afterwards so we can steal the lock if it is free.
-static constexpr int kAdaptiveSpinWaiters = 2;
 
 }  // namespace
 
 // xe_global_mutex implementation (recursive)
-void xe_global_mutex::lock_slow() {
-  pthread_t self = pthread_self();
+void xe_global_mutex::lock() {
+  uint64_t self = xe_current_thread_id();
 
-  // Recursive acquisition - the owner's CAS above failed because the state is
-  // already 1 or 2. Only the owner can observe this, as the state is only ever
-  // written by the owner while owner_ == self.
-  if (owner_ == self) {
+  // Fast path: check if we already own it (recursive lock)
+  if (owner_.load(std::memory_order_relaxed) == self) {
     ++recursion_count_;
     return;
   }
 
-  // Short preliminary spin: many "contended" observations are the tail of an
-  // acquisition where the owner is about to release.
+  // Try to acquire with a simple CAS first (uncontended case)
+  uint32_t expected = 0;
+  if (XE_LIKELY(state_.compare_exchange_strong(
+          expected, 1, std::memory_order_acquire, std::memory_order_relaxed))) {
+    owner_.store(self, std::memory_order_relaxed);
+    recursion_count_ = 1;
+    return;
+  }
+
+  lock_slow();
+}
+
+void xe_global_mutex::lock_slow() {
+  uint64_t self = xe_current_thread_id();
+
+  // Spin phase
   for (int i = 0; i < XE_LINUX_MUTEX_SPINCOUNT; ++i) {
 #if XE_ARCH_AMD64 == 1
     _mm_pause();
 #endif
-    uint32_t expected = kUnlocked;
-    if (state_.compare_exchange_strong(expected, kLocked,
-                                       std::memory_order_acquire,
+    uint32_t expected = 0;
+    if (state_.compare_exchange_strong(expected, 1, std::memory_order_acquire,
                                        std::memory_order_relaxed)) {
-      owner_ = self;
+      owner_.store(self, std::memory_order_relaxed);
       recursion_count_ = 1;
       return;
     }
   }
 
-  // Exponential backoff with yields before queuing on the futex: avoids a
-  // thundering herd of futex wakes and gives the owner a chance to finish.
-  for (int i = 0; i < 8; ++i) {
-    sched_yield();
-    uint32_t expected = kUnlocked;
-    if (state_.compare_exchange_strong(expected, kLocked,
-                                       std::memory_order_acquire,
+  // Slow path: use futex
+  while (true) {
+    // Mark as contended (state = 2) and wait
+    uint32_t state = state_.exchange(2, std::memory_order_acquire);
+    if (state == 0) {
+      // We got the lock while marking contended
+      owner_.store(self, std::memory_order_relaxed);
+      recursion_count_ = 1;
+      return;
+    }
+
+    // Wait on futex
+    futex_wait(&state_, 2);
+
+    // Try to acquire after wakeup
+    uint32_t expected = 0;
+    if (state_.compare_exchange_strong(expected, 2, std::memory_order_acquire,
                                        std::memory_order_relaxed)) {
-      owner_ = self;
+      owner_.store(self, std::memory_order_relaxed);
       recursion_count_ = 1;
       return;
-    }
-    if (i > 2) {
-      // Keep the backoff bounded; the futex wait below does the real sleeping.
-      break;
-    }
-  }
-
-  int wait_count = 0;
-  for (;;) {
-    // Mark as contended so that the owner wakes a waiter on release.
-    uint32_t state = state_.exchange(kContended, std::memory_order_acquire);
-    if (state == kUnlocked) {
-      // We got the lock while marking it contended.
-      owner_ = self;
-      recursion_count_ = 1;
-      return;
-    }
-
-    if (wait_count >= kAdaptiveSpinWaiters) {
-      // Steal without sleeping if the lock is free now.
-      uint32_t expected = kUnlocked;
-      if (state_.compare_exchange_strong(expected, kContended,
-                                         std::memory_order_acquire,
-                                         std::memory_order_relaxed)) {
-        owner_ = self;
-        recursion_count_ = 1;
-        return;
-      }
-    }
-
-    struct timespec timeout;
-    timeout.tv_sec = 0;
-    timeout.tv_nsec = XE_LINUX_MUTEX_ADAPTIVE_SPIN_NS;
-    if (futex_wait_timeout(&state_, kContended, &timeout) == 0) {
-      // Woken by the owner's futex_wake: the lock was released then possibly
-      // re-acquired. Try once without sleeping, then sleep for real so we
-      // don't spin on a long-held lock.
-      uint32_t expected = kUnlocked;
-      if (state_.compare_exchange_strong(expected, kContended,
-                                         std::memory_order_acquire,
-                                         std::memory_order_relaxed)) {
-        owner_ = self;
-        recursion_count_ = 1;
-        return;
-      }
-      ++wait_count;
-    } else {
-      // Timeout or spurious wakeup: the holder may be running long, so try to
-      // steal the lock next time around and then sleep without a timeout.
-      ++wait_count;
     }
   }
 }
 
-void xe_global_mutex::unlock_slow() {
-  if (recursion_count_ > 1) {
-    --recursion_count_;
+void xe_global_mutex::unlock() {
+  if (--recursion_count_ > 0) {
     return;  // Still have recursive locks
   }
 
-  owner_ = 0;
-  // unlock() already published kUnlocked before calling this; reaching the slow
-  // path means it observed the contended state, so a waiter is queued on the
-  // futex and must be woken exactly once. Re-exchanging the state here would
-  // read kUnlocked again and silently lose that wakeup.
-  futex_wake(&state_, 1);
+  owner_.store(0, std::memory_order_relaxed);
+
+  // If state was 2 (contended), we need to wake a waiter
+  if (state_.exchange(0, std::memory_order_release) == 2) {
+    futex_wake(&state_, 1);
+  }
 }
 
 bool xe_global_mutex::try_lock() {
-  pthread_t self = pthread_self();
+  uint64_t self = xe_current_thread_id();
 
   // Check for recursive lock
-  if (owner_ == self) {
+  if (owner_.load(std::memory_order_relaxed) == self) {
     ++recursion_count_;
     return true;
   }
 
-  uint32_t expected = kUnlocked;
-  if (state_.compare_exchange_strong(expected, kLocked,
-                                     std::memory_order_acquire,
+  uint32_t expected = 0;
+  if (state_.compare_exchange_strong(expected, 1, std::memory_order_acquire,
                                      std::memory_order_relaxed)) {
-    owner_ = self;
+    owner_.store(self, std::memory_order_relaxed);
     recursion_count_ = 1;
     return true;
   }

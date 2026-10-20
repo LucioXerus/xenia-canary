@@ -276,31 +276,15 @@ void WaitForMultiObjectSignal(uint32_t expected,
 class PosixConditionBase {
  public:
   PosixConditionBase() {
-    // Initialize as a recursive robust mutex.
-    //
-    // Robust: a guest thread being terminated while holding the lock must not
-    // wedge every future waiter (EOWNERDEAD recovery below).
-    //
-    // Recursive: Wait() takes the mutex through a std::unique_lock while
-    // Signal()/Reset()/Release() do the same from their own call paths, and
-    // WaitMultiple() uses pthread_mutex_trylock directly on the native handle.
-    // Mixing the C++ wrapper and the raw pthread entry points means a thread
-    // can legitimately relock a mutex it already holds, so the recursive type
-    // is required for correctness rather than just convenience.
-    //
-    // Note that a robust mutex cannot take the inline fast path: the kernel has
-    // to track the owning TID to detect a dying owner, so every lock goes
-    // through __pthread_mutex_lock_full. Measured at ~17ns vs ~5ns for a plain
-    // mutex, but it buys guaranteed progress if a guest thread dies mid-signal.
+    // Initialize as robust mutex to handle thread termination gracefully
     pthread_mutexattr_t attr;
     pthread_mutexattr_init(&attr);
     pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST);
-    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
 
     // Get the native handle and set it as robust
     auto native_mutex = static_cast<pthread_mutex_t*>(mutex_.native_handle());
     pthread_mutex_destroy(native_mutex);      // Destroy default mutex
-    pthread_mutex_init(native_mutex, &attr);  // Reinit as recursive + robust
+    pthread_mutex_init(native_mutex, &attr);  // Reinit as robust
     pthread_mutexattr_destroy(&attr);
   }
 
@@ -311,10 +295,17 @@ class PosixConditionBase {
     bool executed;
     auto predicate = [this] { return this->signaled(); };
 
-    // Lock through the C++ wrapper so the mutex is held exactly once. Signal()
-    // and friends take the same mutex the same way, which is why the handle is
-    // recursive: a nested lock from this thread is still legal.
-    std::unique_lock<std::mutex> lock(mutex_);
+    // Handle robust mutex locking
+    auto native_mutex = static_cast<pthread_mutex_t*>(mutex_.native_handle());
+    int lock_result = pthread_mutex_lock(native_mutex);
+    if (lock_result == EOWNERDEAD) {
+      // Recover from dead owner
+      pthread_mutex_consistent(native_mutex);
+    } else if (lock_result != 0) {
+      return WaitResult::kFailed;
+    }
+
+    std::unique_lock<std::mutex> lock(mutex_, std::adopt_lock);
 
     if (predicate()) {
       executed = true;
@@ -1113,20 +1104,6 @@ class PosixWaitHandle {
  public:
   virtual ~PosixWaitHandle();
   virtual PosixConditionBase& condition() = 0;
-
-  // Type test usable without RTTI. Every wait performs a cross-cast from
-  // WaitHandle to this interface, and a dynamic_cast across a virtual base is
-  // an expensive libstdc++ __do_dyncast walk - measurable in guest wait loops.
-  // The tag check makes the common case a single load, and dynamic_cast is
-  // kept only as the fallback so the null result for non-POSIX handles stays
-  // identical.
-  static PosixWaitHandle* From(WaitHandle* wait_handle) {
-    if (!wait_handle ||
-        wait_handle->handle_type() != WaitHandle::HandleType::kPosix) {
-      return nullptr;
-    }
-    return dynamic_cast<PosixWaitHandle*>(wait_handle);
-  }
 };
 
 // Out-of-line destructor to ensure proper RTTI/vtable emission
@@ -1143,10 +1120,6 @@ class PosixConditionHandle : public T, public PosixWaitHandle {
   PosixConditionHandle(bool manual_reset, bool initial_state);
   PosixConditionHandle(uint32_t initial_count, uint32_t maximum_count);
   ~PosixConditionHandle() override = default;
-
-  WaitHandle::HandleType handle_type() const override {
-    return WaitHandle::HandleType::kPosix;
-  }
 
   PosixCondition<T>& condition() override { return handle_; }
   [[nodiscard]] void* native_handle() const override {
@@ -1182,7 +1155,7 @@ PosixConditionHandle<Thread>::PosixConditionHandle(pthread_t thread)
 
 WaitResult Wait(WaitHandle* wait_handle, bool is_alertable,
                 std::chrono::milliseconds timeout) {
-  auto posix_wait_handle = PosixWaitHandle::From(wait_handle);
+  auto posix_wait_handle = dynamic_cast<PosixWaitHandle*>(wait_handle);
   if (posix_wait_handle == nullptr) {
     return WaitResult::kFailed;
   }
@@ -1201,9 +1174,9 @@ WaitResult SignalAndWait(WaitHandle* wait_handle_to_signal,
                          std::chrono::milliseconds timeout) {
   auto result = WaitResult::kFailed;
   auto posix_wait_handle_to_signal =
-      PosixWaitHandle::From(wait_handle_to_signal);
+      dynamic_cast<PosixWaitHandle*>(wait_handle_to_signal);
   auto posix_wait_handle_to_wait_on =
-      PosixWaitHandle::From(wait_handle_to_wait_on);
+      dynamic_cast<PosixWaitHandle*>(wait_handle_to_wait_on);
   if (posix_wait_handle_to_signal == nullptr ||
       posix_wait_handle_to_wait_on == nullptr) {
     return WaitResult::kFailed;
@@ -1227,7 +1200,7 @@ std::pair<WaitResult, size_t> WaitMultiple(WaitHandle* wait_handles[],
   std::vector<PosixConditionBase*> conditions;
   conditions.reserve(wait_handle_count);
   for (size_t i = 0u; i < wait_handle_count; ++i) {
-    auto handle = PosixWaitHandle::From(wait_handles[i]);
+    auto handle = dynamic_cast<PosixWaitHandle*>(wait_handles[i]);
     if (handle == nullptr) {
       return std::make_pair(WaitResult::kFailed, 0);
     }
