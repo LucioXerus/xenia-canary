@@ -22,160 +22,36 @@ ObjectTable::ObjectTable() {}
 
 ObjectTable::~ObjectTable() { Reset(); }
 
-ObjectTable::ReaderShard ObjectTable::shards_[ObjectTable::kReaderShardCount];
-
-static uint32_t PickReaderShard() {
-  // Resolved once per thread. Only performance depends on the choice: shards
-  // hold per-thread counters that add up, so a collision costs a shared cache
-  // line, not correctness. threading::current_thread_id() cannot be used here
-  // because Xenia replaces it with the guest handle once a guest thread runs.
-  static const thread_local uint32_t shard = [] {
-    const auto tid = std::hash<std::thread::id>()(std::this_thread::get_id());
-    return static_cast<uint32_t>((tid >> 5) ^ (tid >> 13)) &
-           (ObjectTable::kReaderShardCount - 1);
-  }();
-  return shard;
-}
-
-bool ObjectTable::AnyReaderActive() {
-  for (uint32_t i = 0; i < kReaderShardCount; ++i) {
-    if (shards_[i].active.load(std::memory_order_relaxed)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-void ObjectTable::DropTableReference(XObject* object) {
-  // The object is already gone from its entry, so no lookup started from here
-  // on can reach it. One that is mid-lookup may still be about to retain it,
-  // though, so check for that first: the common case allocates nothing.
-  std::atomic_thread_fence(std::memory_order_seq_cst);
-  if (!AnyReaderActive()) {
-    object->Release();
-    // A lookup that just finished may have been the last one holding up a
-    // parked reference.
-    ReclaimRetired();
-    return;
-  }
-  retired_ = new RetiredObject{retired_, object};
-  ReclaimRetired();
-}
-
-void ObjectTable::ReclaimRetired() {
-  if (!retired_) {
-    return;
-  }
-  // Pairs with the fence in BeginLookup(): a lookup that announced itself
-  // before its entry was emptied must have finished before anything it may
-  // reach is released.
-  std::atomic_thread_fence(std::memory_order_seq_cst);
-  if (AnyReaderActive()) {
-    // A lookup is in flight. The next retirement re-checks.
-    return;
-  }
-  RetiredObject* entry = retired_;
-  retired_ = nullptr;
-  while (entry) {
-    RetiredObject* next = entry->next;
-    entry->object->Release();
-    delete entry;
-    entry = next;
-  }
-}
-
 void ObjectTable::Reset() {
   auto global_lock = global_critical_region_.Acquire();
 
   // Release all objects, clearing their handles first so destructors
-  // don't assert on non-empty handles_. The references go through
-  // DropTableReference(), since a lookup may be about to retain one.
+  // don't assert on non-empty handles_.
   for (uint32_t n = 0; n < table_capacity_; n++) {
     ObjectTableEntry& entry = table_[n];
     if (entry.object) {
-      XObject* object = entry.object;
-      object->handles().clear();
+      entry.object->handles().clear();
       entry.handle_ref_count = 0;
-      __atomic_store_n(&entry.object, static_cast<XObject*>(nullptr),
-                       __ATOMIC_RELEASE);
-      DropTableReference(object);
+      entry.object->Release();
     }
   }
   for (uint32_t n = 0; n < host_table_capacity_; n++) {
     ObjectTableEntry& entry = host_table_[n];
     if (entry.object) {
-      XObject* object = entry.object;
-      object->handles().clear();
+      entry.object->handles().clear();
       entry.handle_ref_count = 0;
-      __atomic_store_n(&entry.object, static_cast<XObject*>(nullptr),
-                       __ATOMIC_RELEASE);
-      DropTableReference(object);
+      entry.object->Release();
     }
   }
 
-  // Lookups are lock-free, so a thread may still be indexing the old array
-  // after it has been cleared: retire rather than free, then publish null so
-  // no new lookup can reach those arrays.
-  RetireArray(table_);
-  RetireArray(host_table_);
-  __atomic_store_n(&table_, static_cast<ObjectTableEntry*>(nullptr),
-                   __ATOMIC_RELEASE);
-  __atomic_store_n(&host_table_, static_cast<ObjectTableEntry*>(nullptr),
-                   __ATOMIC_RELEASE);
-  // Publish the zero capacities with release as well: lookups pair these with
-  // acquire loads, and a reader that observed a nonzero capacity but a null
-  // array must not index it (both LookupObject() branches guard against null).
-  __atomic_store_n(&table_capacity_, 0u, __ATOMIC_RELEASE);
-  __atomic_store_n(&host_table_capacity_, 0u, __ATOMIC_RELEASE);
+  table_capacity_ = 0;
+  host_table_capacity_ = 0;
   last_free_entry_ = 0;
   last_free_host_entry_ = 0;
-  ReclaimRetired();
-}
-
-// Retires an array replaced by Resize() or Reset().
-void ObjectTable::RetireArray(ObjectTableEntry* array) {
-  // Lock-free lookups make it impossible to free a replaced array at a safe
-  // point: a reader that loaded it may still be in the middle of a lookup on
-  // another thread, so neither immediate free nor reuse is safe. Growth is
-  // geometric and the tables are small (an entry is 16 bytes), so the total
-  // retired memory is at most twice the table size ever reached and only
-  // happens on the handful of rare resizes.
-  (void)array;
-}
-
-bool ObjectTable::Resize(uint32_t new_capacity, bool host) {
-  const uint32_t capacity = host ? host_table_capacity_ : table_capacity_;
-  const size_t new_size = new_capacity * sizeof(ObjectTableEntry);
-  const size_t old_size = capacity * sizeof(ObjectTableEntry);
-  // Never realloc(): a lock-free LookupObject() may be reading the old array
-  // while the table is being grown. Instead build a new array, publish it with
-  // a release store, and retire the old one so readers that already loaded the
-  // old pointer can finish their lookup safely.
-  auto new_table = reinterpret_cast<ObjectTableEntry*>(malloc(new_size));
-  if (!new_table) {
-    return false;
-  }
-  if (capacity) {
-    std::memcpy(new_table, host ? host_table_ : table_, old_size);
-  }
-  std::memset(reinterpret_cast<uint8_t*>(new_table) + old_size, 0,
-              new_size - old_size);
-
-  // Publish the new pointer and capacity in that order (release) so lock-free
-  // handle lookups never observe a capacity that is larger than the table they
-  // are indexing into.
-  if (host) {
-    last_free_host_entry_ = capacity;
-    __atomic_store_n(&host_table_, new_table, __ATOMIC_RELEASE);
-    __atomic_store_n(&host_table_capacity_, new_capacity, __ATOMIC_RELEASE);
-  } else {
-    last_free_entry_ = capacity;
-    __atomic_store_n(&table_, new_table, __ATOMIC_RELEASE);
-    __atomic_store_n(&table_capacity_, new_capacity, __ATOMIC_RELEASE);
-  }
-
-  // The array is deliberately not freed (see RetireArray).
-  return true;
+  free(table_);
+  table_ = nullptr;
+  free(host_table_);
+  host_table_ = nullptr;
 }
 
 X_STATUS ObjectTable::FindFreeSlot(uint32_t* out_slot, bool host) {
@@ -211,16 +87,41 @@ X_STATUS ObjectTable::FindFreeSlot(uint32_t* out_slot, bool host) {
   return X_STATUS_SUCCESS;
 }
 
+bool ObjectTable::Resize(uint32_t new_capacity, bool host) {
+  uint32_t capacity = host ? host_table_capacity_ : table_capacity_;
+  uint32_t new_size = new_capacity * sizeof(ObjectTableEntry);
+  uint32_t old_size = capacity * sizeof(ObjectTableEntry);
+  auto new_table = reinterpret_cast<ObjectTableEntry*>(
+      realloc(host ? host_table_ : table_, new_size));
+  if (!new_table) {
+    return false;
+  }
+
+  // Zero out new entries.
+  if (new_size > old_size) {
+    std::memset(reinterpret_cast<uint8_t*>(new_table) + old_size, 0,
+                new_size - old_size);
+  }
+
+  if (host) {
+    last_free_host_entry_ = capacity;
+    host_table_capacity_ = new_capacity;
+    host_table_ = new_table;
+  } else {
+    last_free_entry_ = capacity;
+    table_capacity_ = new_capacity;
+    table_ = new_table;
+  }
+
+  return true;
+}
+
 X_STATUS ObjectTable::AddHandle(XObject* object, X_HANDLE* out_handle) {
   X_STATUS result = X_STATUS_SUCCESS;
 
   uint32_t handle = 0;
   {
     auto global_lock = global_critical_region_.Acquire();
-
-    // A retirement can be left parked by a lookup that was in flight; handle
-    // creation is frequent, so use it to retry.
-    ReclaimRetired();
 
     // Find a free slot.
     uint32_t slot = 0;
@@ -230,7 +131,7 @@ X_STATUS ObjectTable::AddHandle(XObject* object, X_HANDLE* out_handle) {
     // Stash.
     if (XSUCCEEDED(result)) {
       ObjectTableEntry& entry = host_object ? host_table_[slot] : table_[slot];
-      __atomic_store_n(&entry.object, object, __ATOMIC_RELEASE);
+      entry.object = object;
       entry.handle_ref_count = 1;
       handle = slot << 2;
       if (!host_object) {
@@ -321,11 +222,7 @@ X_STATUS ObjectTable::RemoveHandle(X_HANDLE handle) {
 
   if (entry->object) {
     auto object = entry->object;
-    // Release store: LookupObject() reads the field lock-free, and on a
-    // weakly-ordered target the clearing of the pointer must be published
-    // before the object can be destroyed by the Release() below.
-    __atomic_store_n(&entry->object, static_cast<XObject*>(nullptr),
-                     __ATOMIC_RELEASE);
+    entry->object = nullptr;
     assert_zero(entry->handle_ref_count);
     entry->handle_ref_count = 0;
 
@@ -341,9 +238,8 @@ X_STATUS ObjectTable::RemoveHandle(X_HANDLE handle) {
     if (!object->name().empty()) {
       RemoveNameMapping(object->name());
     }
-    // Release now that the object has been removed from the table. Deferred:
-    // a lock-free lookup may still be about to retain it.
-    DropTableReference(object);
+    // Release now that the object has been removed from the table.
+    object->Release();
   }
 
   return X_STATUS_SUCCESS;
@@ -378,15 +274,10 @@ void ObjectTable::PurgeAllObjects() {
   for (uint32_t slot = 0; slot < table_capacity_; slot++) {
     auto& entry = table_[slot];
     if (entry.object) {
-      XObject* object = entry.object;
       entry.handle_ref_count = 0;
-      object->ReleaseHandle();
+      entry.object->ReleaseHandle();
 
-      __atomic_store_n(&entry.object, static_cast<XObject*>(nullptr),
-                       __ATOMIC_RELEASE);
-      // ReleaseHandle() drops the handle reference; the table still owns one,
-      // which is dropped only after the entry is empty.
-      DropTableReference(object);
+      entry.object = nullptr;
     }
   }
 }
@@ -404,15 +295,11 @@ ObjectTable::ObjectTableEntry* ObjectTable::LookupTableInLock(X_HANDLE handle) {
 
   const bool is_host_object = XObject::is_handle_host_object(handle);
   uint32_t slot = GetHandleSlot(handle, is_host_object);
-  // Bound the slot with '<': table_capacity_ is the *count* of entries, so the
-  // last valid index is capacity - 1. A handle crafted by the guest with
-  // slot == capacity previously returned a pointer one past the end of the
-  // array, which ReleaseHandle()/RetainHandle() then read and wrote through.
   if (is_host_object) {
-    if (slot < host_table_capacity_) {
+    if (slot <= host_table_capacity_) {
       return &host_table_[slot];
     }
-  } else if (slot < table_capacity_) {
+  } else if (slot <= table_capacity_) {
     return &table_[slot];
   }
 
@@ -434,70 +321,37 @@ XObject* ObjectTable::LookupObject(X_HANDLE handle, bool already_locked) {
     return nullptr;
   }
 
+  XObject* object = nullptr;
+  if (!already_locked) {
+    global_critical_region_.mutex().lock();
+  }
+
   const bool is_host_object = XObject::is_handle_host_object(handle);
   uint32_t slot = GetHandleSlot(handle, is_host_object);
-  // Publish/consume protocol with Resize(): the new table is stored with
-  // release, then the (larger) capacity with release; readers acquire-load the
-  // capacity first and only then the table, so a capacity that covers the slot
-  // always comes with a table that covers it.
-  ObjectTableEntry* entries;
-  uint32_t capacity;
-  XObject* object;
+
+  // Verify slot.
   if (is_host_object) {
-    capacity = __atomic_load_n(&host_table_capacity_, __ATOMIC_ACQUIRE);
-    if (slot >= capacity) {
-      return nullptr;
+    if (slot < host_table_capacity_) {
+      ObjectTableEntry& entry = host_table_[slot];
+      if (entry.object) {
+        object = entry.object;
+      }
     }
-    entries = __atomic_load_n(&host_table_, __ATOMIC_ACQUIRE);
-    if (!entries) {
-      return nullptr;
-    }
-  } else {
-    capacity = __atomic_load_n(&table_capacity_, __ATOMIC_ACQUIRE);
-    if (slot >= capacity) {
-      return nullptr;
-    }
-    entries = __atomic_load_n(&table_, __ATOMIC_ACQUIRE);
-    if (!entries) {
-      return nullptr;
+  } else if (slot < table_capacity_) {
+    ObjectTableEntry& entry = table_[slot];
+    if (entry.object) {
+      object = entry.object;
     }
   }
 
-  // Handle lookups are the single hottest kernel operation (every wait, read,
-  // write and signal is addressed by handle), so this is a lock-free lookup:
-  // take a reference on the target before touching it, then check that the
-  // entry still refers to that object.
-  //
-  // This is only safe because an entry's object pointer is never replaced
-  // while it is non-null: CloseHandle clears it under the global lock, and the
-  // slot stays empty (owned by the highest handle to the object, only the last
-  // CloseHandle clears it) until a new object is placed there. The
-  // relationship between the table and "alive" objects is then:
-  //  - while entry.object != null, its reference ("the table's reference")
-  //    keeps the object alive, and it is only dropped after the pointer is
-  //    cleared, so a non-null pointer can always be dereferenced;
-  //  - if we observed the pointer before it was cleared, Retain() still keeps
-  //    the object alive even if the clearing thread drops the table's
-  //    reference concurrently - which is why that drop is deferred: see
-  //    DropTableReference(). Announcing the lookup here is what lets the
-  //    table know this may be happening, and the fence in BeginLookup()
-  //    orders the announcement before the load below;
-  //  - the re-check below rejects the case where the slot was cleared and
-  //    reused by a different object between the load and the Retain.
-  ReaderShard* shard = &shards_[PickReaderShard()];
-  BeginLookup(shard);
-  object = __atomic_load_n(&entries[slot].object, __ATOMIC_ACQUIRE);
+  // Retain the object pointer.
   if (object) {
     object->Retain();
-    if (XE_UNLIKELY(__atomic_load_n(&entries[slot].object, __ATOMIC_ACQUIRE) !=
-                    object)) {
-      // Closed and the slot was reused while we were retaining: this handle
-      // now refers to a different object.
-      object->Release();
-      object = nullptr;
-    }
   }
-  EndLookup(shard);
+
+  if (!already_locked) {
+    global_critical_region_.mutex().unlock();
+  }
 
   return object;
 }
@@ -619,8 +473,8 @@ X_STATUS ObjectTable::RestoreHandle(X_HANDLE handle, XObject* object) {
 
   if (capacity >= slot) {
     auto& entry = is_host_object ? host_table_[slot] : table_[slot];
+    entry.object = object;
     object->Retain();
-    __atomic_store_n(&entry.object, object, __ATOMIC_RELEASE);
   }
 
   return X_STATUS_SUCCESS;

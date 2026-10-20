@@ -57,17 +57,6 @@ using WaitItem = TimerQueueWaitItem;
    condition_variable::wait_until overflow that plagued the earlier attempts is
    avoided by never passing clock::time_point::max() to the wait (see
    TimerThreadMain).
-
-   edit4: (19.10.2026) The original reason for reverting the blocking wait is
-   long fixed in the in-tree disruptorplus: wait_until_published() now uses the
-   3-argument predicate form, and publishers take the mutex before notifying
-   (signal_all_when_blocking), so publishers do wake the dispatch thread.
-   Profiling (BO2 MP, ~700k samples) showed TimerThreadMain spending 3.74% of
-   all process CPU: the spin strategy busy-polls forever, so an idle timer
-   queue still pins a core. This thread only wakes when a timer is queued or
-   the earliest due_ is reached, which is exactly what a condition variable
-   does for free. The non-Windows path below keeps the blocking strategy; the
-   Windows path keeps the spin strategy from edit2.
 */
 #if XE_PLATFORM_WIN32
 using WaitStrat = dp::spin_wait_strategy;

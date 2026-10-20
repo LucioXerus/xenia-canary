@@ -85,72 +85,23 @@ class xe_unlikely_mutex {
 using xe_mutex = xe_fast_mutex;
 #elif XE_PLATFORM_LINUX == 1 && XE_ENABLE_FAST_LINUX_MUTEX == 1
 
-// Short spin budget: this lock is held by guest threads for potentially long
-// stretches, so spinning in a tight CAS loop on every contention merely burns
-// cycles on the holder's cache line and delays the holder being scheduled.
-#define XE_LINUX_MUTEX_SPINCOUNT 24
+#define XE_LINUX_MUTEX_SPINCOUNT 128
 
-// Futex timeouts used for adaptive spinning when blocked. after 2, the waiter
-// stops sleeping for the full duration of whatever the owner is doing and
-// retries the lock; before 2, it has just woken up and steals uncontended
-// acquisitions without queueing a futex wake.
-static constexpr long XE_LINUX_MUTEX_ADAPTIVE_SPIN_NS = 100000;  // 100 us
-
-// Recursive mutex for Linux backed by futexes.
-//
-// Fast paths (uncontended lock/unlock) are a single atomic instruction each.
-// That is critical here: this guards the global critical region (object table,
-// thread state, many kernel calls), so every guest CPU thread takes and
-// releases it thousands of times per guest millisecond.
-//
-// Contention: the first holder upgrades the state to "contended", so releasing
-// it wakes one waiter immediately (no missed wakeup, no second round trip).
-// Waiters spend a short budget in a non-competing CAS loop -> a compressed
-// exponential backoff with sched_yield -> a double-checked futex wait with an
-// adaptive timeout so they can steal the lock if the owner keeps it for a
-// while. This replaces the previous "spin 128 times then futex, wake one"
-// scheme whose cost was essentially one context-switch round trip per
-// contended acquisition.
+// Fast recursive mutex for Linux using futex
+// Mimics Windows CRITICAL_SECTION behavior: spin before blocking
 class alignas(4096) xe_global_mutex {
-  static constexpr uint32_t kUnlocked = 0;
-  static constexpr uint32_t kLocked = 1;
-  static constexpr uint32_t kContended = 2;
-
-  std::atomic<uint32_t> state_{kUnlocked};
-  pthread_t owner_{0};  // Owner when locked, 0 when free.
+  std::atomic<uint32_t> state_{0};  // 0 = unlocked, 1 = locked, 2 = contended
+  std::atomic<uint64_t> owner_{0};  // pthread_self() of the owner, 0 = free
   uint32_t recursion_count_{0};
 
   void lock_slow();
-  void unlock_slow();
 
  public:
   xe_global_mutex() = default;
   ~xe_global_mutex() = default;
 
-  void lock() {
-    uint32_t expected = kUnlocked;
-    if (XE_LIKELY(state_.compare_exchange_strong(
-            expected, kLocked, std::memory_order_acquire,
-            std::memory_order_relaxed))) {
-      owner_ = pthread_self();
-      recursion_count_ = 1;
-      return;
-    }
-    lock_slow();
-  }
-
-  void unlock() {
-    if (XE_LIKELY(recursion_count_ == 1)) {
-      owner_ = 0;
-      // Exchange, not store: the previous value tells us if we must wake.
-      if (XE_LIKELY(state_.exchange(kUnlocked, std::memory_order_release) ==
-                    kLocked)) {
-        return;  // Nobody waiting.
-      }
-    }
-    unlock_slow();
-  }
-
+  void lock();
+  void unlock();
   bool try_lock();
 };
 using global_mutex_type = xe_global_mutex;
