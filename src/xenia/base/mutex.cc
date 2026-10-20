@@ -204,9 +204,11 @@ void xe_global_mutex::unlock_slow() {
   }
 
   owner_ = 0;
-  if (state_.exchange(kUnlocked, std::memory_order_release) == kContended) {
-    futex_wake(&state_, 1);
-  }
+  // unlock() already published kUnlocked before calling this; reaching the slow
+  // path means it observed the contended state, so a waiter is queued on the
+  // futex and must be woken exactly once. Re-exchanging the state here would
+  // read kUnlocked again and silently lose that wakeup.
+  futex_wake(&state_, 1);
 }
 
 bool xe_global_mutex::try_lock() {
