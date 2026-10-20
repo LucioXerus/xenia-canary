@@ -88,26 +88,15 @@ object_ref<T> LookupNamedObject(KernelState* kernel_state,
   return nullptr;
 }
 
-enum CreateThreadFlags : uint32_t {
-  ThreadInitiallySuspended = 0x00000001,
-  SystemThread = 0x00000002,
-  PriorityClass1 = 0x00000020,
-  PriorityClass2 = 0x00000040,
-  ReturnKThreadPtr = 0x00000080,
-  AffinityCpu0 = 0x01000000,
-  AffinityCpu1 = 0x02000000,
-  AffinityCpu2 = 0x04000000,
-  AffinityCpu3 = 0x08000000,
-  AffinityCpu4 = 0x10000000,
-  AffinityCpu5 = 0x20000000,
-};
-
 inline const std::map<uint32_t, std::string> ex_thread_flag_map = {
     {ThreadInitiallySuspended, "Thread Initially Suspended"},
     {SystemThread, "Guest Created System Thread"},
+    {TLSStatic, "TLS Static"},
     {PriorityClass1, "Thread Priority Class 1"},
     {PriorityClass2, "Thread Priority Class 2"},
     {ReturnKThreadPtr, "Return Kthread Ptr"},
+    {TitleExecutionThread, "Title Execution Thread"},
+    {Hidden, "Hide From Debug List"},
     {AffinityCpu0, "Thread Starts At Cpu 1"},
     {AffinityCpu1, "Thread Starts At Cpu 2"},
     {AffinityCpu2, "Thread Starts At Cpu 3"},
@@ -484,9 +473,9 @@ dword_result_t KeDelayExecutionThread_entry(dword_t processor_mode,
                                             dword_t alertable,
                                             lpqword_t interval_ptr,
                                             const ppc_context_t& context) {
+  // TODO(Ecredes): Verify whether a null interval should be treated as zero.
   uint64_t interval = interval_ptr ? static_cast<uint64_t>(*interval_ptr) : 0u;
-  return KeDelayExecutionThread(processor_mode, alertable,
-                                interval_ptr ? &interval : nullptr, context);
+  return KeDelayExecutionThread(processor_mode, alertable, &interval, context);
 }
 DECLARE_XBOXKRNL_EXPORT3(KeDelayExecutionThread, kThreading, kImplemented,
                          kBlocking, kHighFrequency);

@@ -89,8 +89,10 @@ DxbcShaderTranslator::DxbcShaderTranslator(
 DxbcShaderTranslator::~DxbcShaderTranslator() = default;
 
 std::vector<uint8_t> DxbcShaderTranslator::CreateDepthOnlyPixelShader(
-    bool zpd_total, Modification::DepthStencilMode depth_stencil_mode) {
+    bool zpd_total, Modification::DepthStencilMode depth_stencil_mode,
+    bool viz_survey) {
   is_depth_only_pixel_shader_ = true;
+  is_viz_survey_pixel_shader_ = viz_survey;
   // TODO(Triang3l): Handle in a nicer way (is_depth_only_pixel_shader_ is a
   // leftover from when a Shader object wasn't used during translation).
   Shader shader(xenos::ShaderType::kPixel, 0, nullptr, 0);
@@ -104,6 +106,7 @@ std::vector<uint8_t> DxbcShaderTranslator::CreateDepthOnlyPixelShader(
       *shader.GetOrCreateTranslation(modification.value);
   TranslateAnalyzedShader(translation);
   is_depth_only_pixel_shader_ = false;
+  is_viz_survey_pixel_shader_ = false;
   return translation.translated_binary();
 }
 
@@ -752,6 +755,13 @@ void DxbcShaderTranslator::StartPixelShader() {
           dxbc::Src::LF(1.0f / GetCurrentDrawResolutionScaleX(),
                         1.0f / GetCurrentDrawResolutionScaleY(), 1.0f, 1.0f));
     }
+    // Add the window offset back when it's carried in the EDRAM bases.
+    // PsParamGen includes it.
+    a_.OpAdd(
+        dxbc::Dest::R(param_gen_temp, 0b0011), dxbc::Src::R(param_gen_temp),
+        LoadSystemConstant(SystemConstants::Index::kParamGenWindowOffset,
+                           offsetof(SystemConstants, param_gen_window_offset),
+                           dxbc::Src::kXYXY));
     if (shader_modification.pixel.param_gen_point) {
       // A point - always front-facing (the upper bit of X is 0), not a line
       // (the upper bit of Z is 0).
@@ -2203,6 +2213,9 @@ constexpr DxbcShaderTranslator::SystemConstantRdef
 
         {"xe_texture_integer_scale_bits", ShaderRdefTypeIndex::kUint4Array8,
          sizeof(uint32_t) * 32},
+
+        {"xe_param_gen_window_offset", ShaderRdefTypeIndex::kFloat2,
+         sizeof(float) * 2, sizeof(uint32_t) * 2},
 };
 
 void DxbcShaderTranslator::WriteResourceDefinition() {
