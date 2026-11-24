@@ -40,6 +40,15 @@ using IconsData = std::map<uint32_t, std::span<const uint8_t>>;
 
 constexpr ImVec2 default_image_icon_size = ImVec2(64.f, 64.f);
 
+// Draws a title's icon, or a placeholder disc when it has none.
+void TitleIcon(ImmediateTexture* icon, ImVec2 size = default_image_icon_size);
+
+ImVec2 DialogButtonSize();
+// Right-aligns the next `count` dialog buttons on this line.
+void RightAlignDialogButtons(int count);
+// Green when primary, grey otherwise.
+bool DialogButton(const char* label, bool primary);
+
 class ImGuiDrawer : public WindowInputListener, public UIDrawer {
  public:
   ImGuiDrawer(Window* window, size_t z_order);
@@ -85,12 +94,9 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
 
   ImmediateTexture* GetLoadingTileIcon() { return loading_tile_icon_.get(); }
 
-  ImFont* GetTitleFont() {
-    if (!GetIO().Fonts->Fonts[1]->IsLoaded()) {
-      return GetIO().Fonts->Fonts[0];
-    }
-    return GetIO().Fonts->Fonts[1];
-  }
+  // For PushFont(nullptr, size). style.FontSizeBase changes with each PushFont.
+  float GetFontSize() const { return font_size_; }
+  float GetTitleFontSize() const { return font_size_ + kTitleFontSizeIncrease; }
 
   void LoadInputSystem(hid::InputSystem* input_system);
   void SetGuideButtonAction(std::function<void(uint8_t)> func);
@@ -109,14 +115,18 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   // For now, no need for OnDpiChanged because redrawing is done continuously.
 
  private:
+  static constexpr float kTitleFontSizeIncrease = 6.0f;
+
   void Initialize();
   void InitializeFonts(const float font_size);
   bool LoadCustomFont(ImGuiIO& io, ImFontConfig& font_config, float font_size);
-  bool LoadWindowsFont(ImGuiIO& io, ImFontConfig& font_config, float font_size);
-  bool LoadJapaneseFont(ImGuiIO& io, float font_size);
+  // Tahoma on Windows, the fontconfig monospace match on Linux.
+  bool LoadSystemFont(ImGuiIO& io, ImFontConfig& font_config, float font_size);
+  void LoadJapaneseFont(ImGuiIO& io, float font_size);
 
   void SetupNotificationTextures();
-  void SetupFontTexture();
+  void UpdateTexture(ImTextureData* texture);
+  void DestroyTextures();
 
   void RenderDrawLists(ImDrawData* data, UIDrawContext& ui_draw_context);
 
@@ -126,6 +136,11 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   void SwitchToPhysicalMouseAndUpdateMousePosition(const MouseEvent& e);
 
   bool IsDrawingDialogs() const { return dialog_loop_next_index_ != SIZE_MAX; }
+
+  bool HasAnythingToDraw() const {
+    return !dialogs_.empty() || !notifications_.empty();
+  }
+
   void DetachIfLastWindowRemoved();
   void UpdateGamepads();
 
@@ -144,6 +159,9 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   // All queued notifications. Notification at index 0 is currently presented
   // one.
   std::vector<ImGuiNotification*> notifications_;
+
+  bool is_input_listener_added_ = false;
+
   // Using an index, not an iterator, because after the erasure, the adjustment
   // must be done for the vector element indices that would be in the iterator
   // range that would be invalidated.
@@ -155,7 +173,6 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   ImmediateDrawer* immediate_drawer_ = nullptr;
   // Resources specific to an immediate drawer - must be destroyed before
   // detaching the presenter.
-  std::unique_ptr<ImmediateTexture> font_texture_;
   std::unique_ptr<ImmediateTexture> locked_achievement_icon_;
   std::unique_ptr<ImmediateTexture> loading_tile_icon_;
 
@@ -175,6 +192,8 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   uint64_t last_frame_time_ticks_;
 
   bool are_notifications_enabled_ = true;
+
+  float font_size_ = 0.0f;
 };
 
 }  // namespace ui

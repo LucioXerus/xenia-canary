@@ -10,6 +10,7 @@
 #include "xenia/kernel/xam/xam_state.h"
 #include "xenia/base/logging.h"
 #include "xenia/emulator.h"
+#include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/friends_util.h"
 #include "xenia/kernel/xam/online_schema.h"
 
@@ -68,6 +69,18 @@ void XamState::LoadOnlineSchema() {
     schema_ptr->schema_ptr = kernel_state_->memory()->HostToGuestVirtual(
         std::to_address(schema_ptr + 1));
     schema_ptr->schema_size = sizeof(OnlineSchemaData_v6_5);
+  }
+}
+
+void XamState::SetUIActive(bool active) {
+  const bool was_active = ui_active_.exchange(active);
+
+  if (active || !was_active) {
+    return;
+  }
+
+  if (auto input_system = kernel_state_->emulator()->input_system()) {
+    ui_input_filter_.OnUIClosed(input_system);
   }
 }
 

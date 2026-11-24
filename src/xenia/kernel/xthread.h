@@ -90,7 +90,7 @@ struct XAPC {
   // KAPC is 0x28(40) bytes? (what's passed to ExAllocatePoolWithTag)
   // This is 4b shorter than NT - looks like the reserved dword at +4 is gone.
   // NOTE: stored in guest memory.
-  uint16_t type;                     // +0
+  xe::be<uint16_t> type;             // +0
   uint8_t apc_mode;                  // +2
   uint8_t enqueued;                  // +3
   xe::be<uint32_t> thread_ptr;       // +4
@@ -229,6 +229,11 @@ enum X_KWAIT_REASON : uint16_t {
   WaitUnk3 = 3,
 };
 
+enum X_KPROCESSOR_MODE : uint32_t {
+  KernelMode = 0,
+  UserMode = 1,
+};
+
 // https://www.geoffchappell.com/studies/windows/km/ntoskrnl/inc/ntos/ke_x/kwait_block.htm
 //  pretty much the vista KWAIT_BLOCK verbatim, except that sparebyte is gone
 //  and WaitType is 2 bytes instead of 1
@@ -244,7 +249,6 @@ struct X_KWAIT_BLOCK {
   // WAIT_ALL or WAIT_ANY
   xe::be<X_KWAIT_REASON> wait_type;
 };
-
 static_assert_size(X_KWAIT_BLOCK, 0x18);
 
 struct X_KTIMER {
@@ -299,7 +303,7 @@ struct X_KTHREAD {
   uint8_t wait_reason;                            // 0xA7
   TypedGuestPointer<X_KWAIT_BLOCK> wait_blocks;   // 0xA8
   uint8_t unk_AC[4];                              // 0xAC
-  int32_t apc_disable_count;                      // 0xB0
+  xe::be<int32_t> apc_disable_count;              // 0xB0
   xe::be<int32_t> quantum;                        // 0xB4
   uint8_t saturation_increment;                   // 0xB8
   uint8_t base_priority;                          // 0xB9
@@ -389,6 +393,8 @@ class XThread : public XObject, public cpu::Thread {
 
   static constexpr uint32_t kThreadKernelStackSize = 0xF0;
 
+  static constexpr uint8_t kMaxSuspendCount = 0x7F;
+
   struct CreationParams {
     uint32_t stack_size;
     uint32_t xapi_thread_startup;
@@ -474,6 +480,8 @@ class XThread : public XObject, public cpu::Thread {
   uint8_t active_cpu() const;
   void SetActiveCpu(uint8_t cpu_index);
 
+  // Slot n sits n + 1 words below the TLS pointer.
+  uint32_t TLSSlotAddress(uint32_t slot) const;
   bool GetTLSValue(uint32_t slot, uint32_t* value_out);
   bool SetTLSValue(uint32_t slot, uint32_t value);
 
@@ -490,7 +498,7 @@ class XThread : public XObject, public cpu::Thread {
   // Performs self-suspension: increments suspend_count and blocks until
   // another thread calls Resume() and suspend_count reaches 0.
   // Returns the previous suspend_count value.
-  uint32_t SelfSuspend();
+  X_STATUS SelfSuspend(uint32_t* out_suspend_count);
 #endif
 
   xe::threading::Thread* thread() { return thread_.get(); }

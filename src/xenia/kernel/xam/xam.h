@@ -23,10 +23,11 @@ namespace xam {
 #pragma pack(push, 4)
 struct X_XAMACCOUNTINFO {
   enum AccountReservedFlags {
+    kVersionMask = 0x000000FF,
     kPasswordProtected = 0x10000000,
     kLiveEnabled = 0x20000000,
     kRecovering = 0x40000000,
-    kVersionMask = 0x000000FF
+    KPartialProfile = 0x80000000
   };
 
   enum AccountUserFlags {
@@ -371,11 +372,6 @@ enum class UserLogonFlags : uint32_t {
 enum class UserContextDevice : uint32_t {
   BigButton = 3,
   Microphone = 4,
-};
-
-enum class WriteTileType {
-  Tile = 1,  // Public
-  Personal = 2,
 };
 
 constexpr uint32_t XMP_MAX_METADATA_STRING = 40;

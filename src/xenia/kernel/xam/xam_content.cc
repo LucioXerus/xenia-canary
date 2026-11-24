@@ -105,48 +105,65 @@ dword_result_t xeXamContentResolve(
       return result;
     };
 
+    // A root name is only supported for HDD content for now.
+    if (root_name_ptr &&
+        content_data.device_id != static_cast<uint32_t>(DummyDeviceId::HDD)) {
+      return X_ERROR_INVALID_PARAMETER;
+    }
+
     uint64_t xuid = 0;
     if (user_index < XUserMaxUserCount) {
       const auto profile =
           kernel_state()->xam_state()->profile_manager()->GetProfile(
               static_cast<uint8_t>(user_index));
-      if (profile && content_data.content_type == XContentType::kSavedGame) {
+      if (profile) {
         xuid = profile->xuid();
       }
     }
 
-    std::string root_device_path = "";
+    std::string path;
+    if (content_data.device_id == static_cast<uint32_t>(DummyDeviceId::HDD)) {
+      // Titles open this path themselves.
+      path = kernel_state()->content_manager()->ResolveHddContentPath(
+          xuid, content_data, create_directory != 0);
 
-    if (root_name_ptr) {
-      // Check if root_name is valid.
-      // root_device_path = std::string(root_name_ptr);
-      // Unsupported for now.
-      return X_ERROR_INVALID_PARAMETER;
-    } else {
-      if (content_data.device_id == static_cast<uint32_t>(DummyDeviceId::HDD)) {
-        root_device_path = "\\Device\\Harddisk0\\Partition1\\Content\\";
-      } else if (content_data.device_id ==
-                 static_cast<uint32_t>(DummyDeviceId::ODD)) {
-        // Or GAME, but D: usually means DVD drive meanwhile GAME always
-        // pinpoints to game, even if it is running from HDD
-        root_device_path = "D:\\content\\";
-      } else {
-        return X_ERROR_INVALID_PARAMETER;
+      if (root_name_ptr) {
+        // A root name mounts a drive at the partition, and the path goes
+        // through it. The path is still returned when the name is taken.
+        constexpr std::string_view kHddPartition =
+            "\\Device\\Harddisk0\\Partition1";
+        const std::string root_name = std::string(root_name_ptr.value()) + ':';
+        auto file_system = kernel_state()->file_system();
+
+        if (file_system->IsSymbolicLinkRegistered(root_name)) {
+          result = X_ERROR_ALREADY_EXISTS;
+        } else {
+          file_system->RegisterSymbolicLink(root_name,
+                                            std::string(kHddPartition) + '\\');
+        }
+
+        path = root_name + path.substr(kHddPartition.size());
       }
+    } else if (content_data.device_id ==
+               static_cast<uint32_t>(DummyDeviceId::ODD)) {
+      // Or GAME, but D: usually means DVD drive meanwhile GAME always
+      // pinpoints to game, even if it is running from HDD
+      path = fmt::format(
+          "D:\\content\\{:016X}\\{:08X}\\{:08X}\\{}",
+          content_data.content_type == XContentType::kSavedGame ? xuid : 0,
+          kernel_state()->title_id(),
+          static_cast<uint32_t>(content_data.content_type.get()),
+          content_data.file_name());
+    } else {
+      return X_ERROR_INVALID_PARAMETER;
     }
 
-    const std::string relative_path = fmt::format(
-        "{:016X}\\{:08X}\\{:08X}\\{}", xuid, kernel_state()->title_id(),
-        static_cast<uint32_t>(content_data.content_type.get()),
-        content_data.file_name());
-
-    string_util::copy_truncating(path_ptr, root_device_path + relative_path,
-                                 path_size);
+    string_util::copy_truncating(path_ptr, path, path_size);
 
     // Check if it exists and try to mount that package
     // Result of buffer_ptr is sent to RtlInitAnsiString.
     // buffer_size is usually 260 (max path).
-    return X_ERROR_SUCCESS;
+    return result;
   };
 
   if (!overlapped_ptr) {
@@ -312,22 +329,36 @@ dword_result_t xeXamContentCreate(dword_t user_index, lpstring_t root_name,
     return X_ERROR_INVALID_NAME;
   }
 
-  // Check if we have something under provided symlink.
-  std::string symlink_path = root_name.value();
-  if (!symlink_path.ends_with(':')) {
-    symlink_path += ':';
-  }
-
-  if (kernel_state()->file_system()->IsSymbolicLinkRegistered(symlink_path)) {
-    return X_ERROR_INVALID_PARAMETER;
-  }
-
   XCONTENT_DATA_INTERNAL content_data{};
   X_RESULT result =
       ReadContentData(content_data_ptr, content_data_size, content_data);
   if (result != X_ERROR_SUCCESS) {
     return result;
   };
+
+  // Check if we have something under provided symlink.
+  std::string symlink_path = root_name.value();
+  if (!symlink_path.ends_with(':')) {
+    symlink_path += ':';
+  }
+
+  // Check if the same package isn't already mounted under the same name.
+  if (kernel_state()->file_system()->IsSymbolicLinkRegistered(symlink_path)) {
+    const auto package =
+        kernel_state()->content_manager()->FindPackage(root_name.value());
+
+    if (!package) {
+      return X_ERROR_INVALID_PARAMETER;
+    }
+
+    // Title can provide -1 as a title_id, so before comparation we need to
+    // modify content_data.
+    content_data.title_id = kernel_state()->title_id();
+
+    return package->GetContentMetadata() == content_data
+               ? X_ERROR_SUCCESS
+               : X_ERROR_INVALID_PARAMETER;
+  }
 
   if (content_data.content_type == XContentType::kMarketplaceContent) {
     xuid = 0;
@@ -522,7 +553,8 @@ dword_result_t XamContentClose_entry(lpstring_t root_name,
       kernel_state()->content_manager()->CloseContent(root_name.value());
 
   if (overlapped_ptr) {
-    kernel_state()->CompleteOverlappedImmediate(overlapped_ptr, result);
+    kernel_state()->CompleteOverlappedImmediateEx(
+        overlapped_ptr, result, X_HRESULT_FROM_WIN32(result), 0);
     return X_ERROR_IO_PENDING;
   } else {
     return result;
@@ -789,7 +821,7 @@ dword_result_t XamSwapDisc_entry(
 
   const std::filesystem::path new_disc_path =
       kernel_state()->emulator()->GetNewDiscPath(xe::to_utf8(text_message));
-  XELOGI("GetNewDiscPath returned path {}.", new_disc_path.string().c_str());
+  XELOGI("GetNewDiscPath returned path {}.", new_disc_path);
 
   // TODO(Gliniak): Implement checking if inserted file is requested one
   kernel_state()->emulator()->MountPath(new_disc_path, mount_path);

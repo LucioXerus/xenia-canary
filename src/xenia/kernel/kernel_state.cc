@@ -13,6 +13,7 @@
 
 #include "xenia/base/byte_stream.h"
 #include "xenia/base/logging.h"
+#include "xenia/base/memory.h"
 #include "xenia/emulator.h"
 #include "xenia/hid/input_system.h"
 #include "xenia/kernel/user_module.h"
@@ -58,7 +59,6 @@ KernelState::KernelState(Emulator* emulator)
     : emulator_(emulator),
       memory_(emulator->memory()),
       dispatch_thread_running_(false),
-      dpc_list_(emulator->memory()),
       kernel_trampoline_group_(emulator->processor()->backend()) {
   assert_null(shared_kernel_state_);
   shared_kernel_state_ = this;
@@ -82,13 +82,27 @@ KernelState::KernelState(Emulator* emulator)
   xenia_assert(fixed_alloc_worked);
 }
 
+KernelState::KernelState(Memory* memory, cpu::Processor* processor,
+                         vfs::VirtualFileSystem* file_system)
+    : emulator_(nullptr),
+      memory_(memory),
+      processor_(processor),
+      file_system_(file_system),
+      dispatch_thread_running_(false),
+      kernel_trampoline_group_(processor->backend()) {
+  assert_null(shared_kernel_state_);
+  shared_kernel_state_ = this;
+  InitializeKernelGuestGlobals();
+  kernel_version_ = KernelVersion(cvars::kernel_build_version);
+}
+
 KernelState::~KernelState() {
   SetExecutableModule(nullptr);
 
   if (dispatch_thread_running_) {
     dispatch_thread_running_ = false;
     dispatch_cond_.notify_all();
-    dispatch_thread_->Wait(0, 0, 0, nullptr);
+    dispatch_thread_->Wait(0, X_KPROCESSOR_MODE::KernelMode, 0, nullptr);
   }
 
   executable_module_.reset();
@@ -328,9 +342,38 @@ void KernelState::RemoveTitleTerminateNotification(uint32_t routine) {
   }
 }
 
-void KernelState::RegisterModule(XModule* module) {}
+// Links the module's loader entry onto the end of the loaded module list,
+// once, so a title walking InLoadOrderLinks finds every module
+void KernelState::RegisterModule(XModule* module) {
+  if (!kernel_guest_globals_ || !module->hmodule_ptr()) {
+    return;
+  }
+  auto global_lock = global_critical_region_.Acquire();
+  auto ldr_data =
+      memory_->TranslateVirtual<X_LDR_DATA_TABLE_ENTRY*>(module->hmodule_ptr());
+  if (ldr_data->in_load_order_links.flink_ptr) {
+    return;
+  }
+  auto block =
+      memory_->TranslateVirtual<KernelGuestGlobals*>(kernel_guest_globals_);
+  util::XeInsertTailList(&block->loaded_modules, &ldr_data->in_load_order_links,
+                         memory_);
+}
 
-void KernelState::UnregisterModule(XModule* module) {}
+void KernelState::UnregisterModule(XModule* module) {
+  if (!module->hmodule_ptr()) {
+    return;
+  }
+  auto global_lock = global_critical_region_.Acquire();
+  auto ldr_data =
+      memory_->TranslateVirtual<X_LDR_DATA_TABLE_ENTRY*>(module->hmodule_ptr());
+  if (!ldr_data->in_load_order_links.flink_ptr) {
+    return;
+  }
+  util::XeRemoveEntryList(&ldr_data->in_load_order_links, memory_);
+  ldr_data->in_load_order_links.flink_ptr = 0;
+  ldr_data->in_load_order_links.blink_ptr = 0;
+}
 
 bool KernelState::RegisterUserModule(object_ref<UserModule> module) {
   auto lock = global_critical_region_.Acquire();
@@ -828,7 +871,10 @@ bool KernelState::IsPatchSignatureProper(
   patch_module->GetOptHeader(XEX_HEADER_DELTA_PATCH_DESCRIPTOR,
                              reinterpret_cast<void**>(&patch_header));
 
-  assert_not_null(patch_header);
+  if (!patch_header) {
+    XELOGE("XEX patch has no delta patch descriptor");
+    return false;
+  }
 
   // Compare hash inside delta descriptor to base XEX signature
   uint8_t digest[0x14];
@@ -891,6 +937,7 @@ void KernelState::UnloadUserModule(const object_ref<UserModule>& module,
   assert_true(iter != user_modules_.end());  // Unloading an unregistered module
                                              // is probably really bad
   user_modules_.erase(iter);
+  UnregisterModule(module.get());
 
   // Ensure this module was not somehow registered twice
   assert_true(std::find_if(user_modules_.begin(), user_modules_.end(),
@@ -1166,8 +1213,9 @@ void KernelState::CompleteOverlappedEx(uint32_t overlapped_ptr, X_RESULT result,
   XOverlappedSetResult(ptr, result);
   XOverlappedSetExtendedError(ptr, extended_error);
   XOverlappedSetLength(ptr, length);
+  // The event is left unsignaled when there is a completion routine.
   X_HANDLE event_handle = XOverlappedGetEvent(ptr);
-  if (event_handle) {
+  if (event_handle && !XOverlappedGetCompletionRoutine(ptr)) {
     auto ev = object_table()->LookupObject<XEvent>(event_handle);
     assert_not_null(ev);
     if (ev) {
@@ -1292,6 +1340,12 @@ void KernelState::CompleteOverlappedDeferredEx(
       post_callback();
     }
   });
+  dispatch_cond_.notify_all();
+}
+
+void KernelState::Dispatch(std::function<void()> fn) {
+  auto global_lock = global_critical_region_.Acquire();
+  dispatch_queue_.push_back(std::move(fn));
   dispatch_cond_.notify_all();
 }
 
@@ -1426,8 +1480,10 @@ bool KernelState::Restore(ByteStream* stream) {
     return false;
   }
 
-  // Restore the object table
-  object_table_.Restore(stream);
+  // Restore the object table.
+  if (!object_table_.Restore(stream)) {
+    return false;
+  }
 
   // TLS bitmap is now stored per-process in X_KPROCESS structures (in guest
   // memory) Skip reading old global TLS bitmap if present in old save files
@@ -1487,6 +1543,84 @@ void KernelState::EndDPCImpersonation(cpu::ppc::PPCContext* context,
   kpcr->current_irql = end_scope.previous_irql_;
   kpcr->prcb_data.dpc_active = 0;
 }
+
+bool KernelState::QueueDpc(uint32_t pcr, uint32_t dpc) {
+  auto global_lock = global_critical_region_.Acquire();
+  for (const auto& queued : queued_dpcs_) {
+    if (queued.second == dpc) {
+      return false;
+    }
+  }
+
+  queued_dpcs_.emplace_back(pcr, dpc);
+  ++queued_dpc_count_;
+  return true;
+}
+
+bool KernelState::DequeueDpc(uint32_t dpc) {
+  auto global_lock = global_critical_region_.Acquire();
+  for (auto it = queued_dpcs_.begin(); it != queued_dpcs_.end(); ++it) {
+    if (it->second == dpc) {
+      queued_dpcs_.erase(it);
+      --queued_dpc_count_;
+      return true;
+    }
+  }
+  return false;
+}
+
+void KernelState::RunQueuedDpcs(cpu::ppc::PPCContext* context) {
+  if (!queued_dpc_count_) {
+    return;
+  }
+  auto thread = XThread::GetCurrentThread();
+  if (!thread) {
+    return;
+  }
+
+  uint32_t pcr = static_cast<uint32_t>(context->r[13]);
+  auto kpcr = context->TranslateVirtualGPR<X_KPCR*>(context->r[13]);
+
+  // A DPC queued from inside a DPC runs once the running one returns.
+  if (kpcr->current_irql >= 2 || kpcr->prcb_data.dpc_active) {
+    return;
+  }
+
+  while (true) {
+    uint32_t dpc_ptr = 0;
+    {
+      auto global_lock = global_critical_region_.Acquire();
+      for (auto it = queued_dpcs_.begin(); it != queued_dpcs_.end(); ++it) {
+        if (it->first == pcr) {
+          dpc_ptr = it->second;
+          queued_dpcs_.erase(it);
+          --queued_dpc_count_;
+          break;
+        }
+      }
+    }
+
+    if (!dpc_ptr) {
+      break;
+    }
+
+    auto dpc = memory()->TranslateVirtual<XDPC*>(dpc_ptr);
+    uint32_t routine = dpc->routine;
+    if (!routine) {
+      continue;
+    }
+
+    uint64_t args[] = {dpc_ptr, uint32_t(dpc->context), uint32_t(dpc->arg1),
+                       uint32_t(dpc->arg2)};
+
+    DPCImpersonationScope dpc_scope{};
+    BeginDPCImpersonation(context, dpc_scope);
+    processor_->Execute(thread->thread_state(), routine, args,
+                        xe::countof(args));
+    EndDPCImpersonation(context, dpc_scope);
+  }
+}
+
 void KernelState::EmulateCPInterruptDPC(uint32_t interrupt_callback,
                                         uint32_t interrupt_callback_data,
                                         uint32_t source, uint32_t cpu) {
@@ -1527,6 +1661,7 @@ void KernelState::EmulateCPInterruptDPC(uint32_t interrupt_callback,
   xboxkrnl::xeKeSetCurrentProcessType(X_PROCTYPE_IDLE, current_context);
 
   EndDPCImpersonation(current_context, dpc_scope);
+  RunQueuedDpcs(current_context);
 }
 
 void KernelState::InitializeProcess(X_KPROCESS* process, uint32_t type,
@@ -1642,6 +1777,7 @@ void KernelState::InitializeKernelGuestGlobals() {
   KernelGuestGlobals* block =
       memory_->TranslateVirtual<KernelGuestGlobals*>(kernel_guest_globals_);
   memset(block, 0, sizeof(KernelGuestGlobals));
+  util::XeInitializeListHead(&block->loaded_modules, memory_);
 
   auto idle_process = memory()->TranslateVirtual<X_KPROCESS*>(GetIdleProcess());
   InitializeProcess(idle_process, X_PROCTYPE_IDLE, 0, 0, 0);
@@ -1665,7 +1801,7 @@ void KernelState::InitializeKernelGuestGlobals() {
       block->XboxKernelDefaultObject.wait_list.flink_ptr;
 
   // init thread object
-  block->ExThreadObjectType.pool_tag = 0x65726854;
+  block->ExThreadObjectType.pool_tag = make_fourcc_le("Thre");
   block->ExThreadObjectType.allocate_proc =
       kernel_trampoline_group_.NewLongtermTrampoline(AllocateThread);
 
@@ -1680,29 +1816,29 @@ void KernelState::InitializeKernelGuestGlobals() {
       kernel_trampoline_group_.NewLongtermTrampoline(SimpleForwardFreePool);
 
   // init event object
-  block->ExEventObjectType.pool_tag = 0x76657645;
+  block->ExEventObjectType.pool_tag = make_fourcc_le("Evev");
   block->ExEventObjectType.allocate_proc = trampoline_allocatepool;
   block->ExEventObjectType.free_proc = trampoline_freepool;
 
   // init mutant object
-  block->ExMutantObjectType.pool_tag = 0x6174754D;
+  block->ExMutantObjectType.pool_tag = make_fourcc_le("Muta");
   block->ExMutantObjectType.allocate_proc = trampoline_allocatepool;
   block->ExMutantObjectType.free_proc = trampoline_freepool;
 
   block->ExMutantObjectType.delete_proc =
       kernel_trampoline_group_.NewLongtermTrampoline(DeleteMutant);
   // init semaphore obj
-  block->ExSemaphoreObjectType.pool_tag = 0x616D6553;
+  block->ExSemaphoreObjectType.pool_tag = make_fourcc_le("Sema");
   block->ExSemaphoreObjectType.allocate_proc = trampoline_allocatepool;
   block->ExSemaphoreObjectType.free_proc = trampoline_freepool;
   // init timer obj
-  block->ExTimerObjectType.pool_tag = 0x656D6954;
+  block->ExTimerObjectType.pool_tag = make_fourcc_le("Time");
   block->ExTimerObjectType.allocate_proc = trampoline_allocatepool;
   block->ExTimerObjectType.free_proc = trampoline_freepool;
   block->ExTimerObjectType.delete_proc =
       kernel_trampoline_group_.NewLongtermTrampoline(DeleteTimer);
   // iocompletion object
-  block->IoCompletionObjectType.pool_tag = 0x706D6F43;
+  block->IoCompletionObjectType.pool_tag = make_fourcc_le("Comp");
   block->IoCompletionObjectType.allocate_proc = trampoline_allocatepool;
   block->IoCompletionObjectType.free_proc = trampoline_freepool;
   block->IoCompletionObjectType.delete_proc =
@@ -1710,7 +1846,7 @@ void KernelState::InitializeKernelGuestGlobals() {
   block->IoCompletionObjectType.unknown_size_or_object_ = oddobject_offset;
 
   // iodevice object
-  block->IoDeviceObjectType.pool_tag = 0x69766544;
+  block->IoDeviceObjectType.pool_tag = make_fourcc_le("Devi");
   block->IoDeviceObjectType.allocate_proc = trampoline_allocatepool;
   block->IoDeviceObjectType.free_proc = trampoline_freepool;
   block->IoDeviceObjectType.unknown_size_or_object_ = oddobject_offset;
@@ -1718,7 +1854,7 @@ void KernelState::InitializeKernelGuestGlobals() {
       kernel_trampoline_group_.NewLongtermTrampoline(UnknownProcIoDevice);
 
   // file object
-  block->IoFileObjectType.pool_tag = 0x656C6946;
+  block->IoFileObjectType.pool_tag = make_fourcc_le("File");
   block->IoFileObjectType.allocate_proc = trampoline_allocatepool;
   block->IoFileObjectType.free_proc = trampoline_freepool;
   block->IoFileObjectType.unknown_size_or_object_ =
@@ -1731,13 +1867,13 @@ void KernelState::InitializeKernelGuestGlobals() {
       kernel_trampoline_group_.NewLongtermTrampoline(UnknownFileProc);
 
   // directory object
-  block->ObDirectoryObjectType.pool_tag = 0x65726944;
+  block->ObDirectoryObjectType.pool_tag = make_fourcc_le("Dire");
   block->ObDirectoryObjectType.allocate_proc = trampoline_allocatepool;
   block->ObDirectoryObjectType.free_proc = trampoline_freepool;
   block->ObDirectoryObjectType.unknown_size_or_object_ = oddobject_offset;
 
   // symlink object
-  block->ObSymbolicLinkObjectType.pool_tag = 0x626D7953;
+  block->ObSymbolicLinkObjectType.pool_tag = make_fourcc_le("Symb");
   block->ObSymbolicLinkObjectType.allocate_proc = trampoline_allocatepool;
   block->ObSymbolicLinkObjectType.free_proc = trampoline_freepool;
   block->ObSymbolicLinkObjectType.unknown_size_or_object_ = oddobject_offset;
@@ -1762,10 +1898,19 @@ void KernelState::InitializeKernelGuestGlobals() {
       {XObject::Type::Mutant,
        kernel_guest_globals_ +
            offsetof32(KernelGuestGlobals, ExMutantObjectType)},
+      {XObject::Type::Timer,
+       kernel_guest_globals_ +
+           offsetof32(KernelGuestGlobals, ExTimerObjectType)},
       {XObject::Type::Device,
        kernel_guest_globals_ +
            offsetof32(KernelGuestGlobals, IoDeviceObjectType)}};
   xboxkrnl::xeKeSetEvent(&block->UsbdBootEnumerationDoneEvent, 1, 0);
+
+  // Unsignalled synchronization events
+  block->UsbdDriverLoadRequiredEvent.header.type =
+      X_OBJECT_TYPES::EventSynchronizationObject;
+  block->StfsDeviceErrorEvent.header.type =
+      X_OBJECT_TYPES::EventSynchronizationObject;
 }
 
 void KernelState::InitializeXbdmCpuCounters() {

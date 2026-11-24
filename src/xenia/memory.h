@@ -77,6 +77,20 @@ inline xe::memory::PageAccess ToPageAccess(uint32_t protect) {
   }
 }
 
+// A region of the encrypted 64k xex pages that NtAllocateEncryptedMemory
+// allocates from.
+struct EncryptedMemoryRegion {
+  uint32_t base;
+  uint32_t size;
+
+  bool Contains(uint32_t address) const { return address - base < size; }
+};
+
+constexpr EncryptedMemoryRegion kSystemEncryptedMemoryRegion = {0x8C000000,
+                                                                0x01000000};
+constexpr EncryptedMemoryRegion kTitleEncryptedMemoryRegion = {0x8D000000,
+                                                               0x03000000};
+
 // Equivalent to the Win32 MEMORY_BASIC_INFORMATION struct.
 struct HeapAllocationInfo {
   // A pointer to the base address of the region of pages.
@@ -210,11 +224,11 @@ class BaseHeap {
   bool QueryBaseAndSize(uint32_t* in_out_address, uint32_t* out_size);
 
   // Queries the current protection mode of the region containing the given
-  // address.
-  bool QueryProtect(uint32_t address, uint32_t* out_protect);
+  // address, and its allocation state if out_state is set.
+  bool QueryProtect(uint32_t address, uint32_t* out_protect,
+                    uint32_t* out_state = nullptr);
 
-  // Queries the currently strictest readability and writability for the entire
-  // range.
+  // Queries access across committed pages in the inclusive address range.
   xe::memory::PageAccess QueryRangeAccess(uint32_t low_address,
                                           uint32_t high_address);
 
@@ -602,6 +616,12 @@ class Memory {
     return const_cast<BaseHeap*>(
         const_cast<const Memory*>(this)->LookupHeap(address));
   }
+
+  // Queries access across committed pages in a guest virtual address range.
+  // Empty, overflowing, unmapped, or cross-heap ranges return kNoAccess.
+  // Returns kReadWrite if all pages are readable and writable, kReadOnly if
+  // all are readable, and kNoAccess otherwise.
+  xe::memory::PageAccess QueryRangeAccess(uint32_t address, uint32_t length);
 
   // Gets the heap with the given properties.
   BaseHeap* LookupHeapByType(bool physical, uint32_t page_size);

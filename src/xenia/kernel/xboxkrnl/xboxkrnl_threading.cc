@@ -238,16 +238,14 @@ dword_result_t NtResumeThread_entry(dword_t handle,
 DECLARE_XBOXKRNL_EXPORT1(NtResumeThread, kThreading, kImplemented);
 
 dword_result_t KeResumeThread_entry(pointer_t<X_KTHREAD> thread_ptr) {
-  X_STATUS result = X_STATUS_SUCCESS;
+  uint32_t previous_suspend_count = 0;
   auto thread = XObject::GetNativeObject<XThread>(kernel_state(), thread_ptr,
                                                   ThreadObject);
   if (thread) {
-    result = thread->Resume();
-  } else {
-    result = X_STATUS_INVALID_HANDLE;
+    thread->Resume(&previous_suspend_count);
   }
 
-  return result;
+  return previous_suspend_count;
 }
 DECLARE_XBOXKRNL_EXPORT1(KeResumeThread, kThreading, kImplemented);
 
@@ -277,8 +275,7 @@ dword_result_t NtSuspendThread_entry(dword_t handle,
 
         if (is_self_suspend) {
           XELOGD("Thread {:X} self-suspending", thread->handle());
-          suspend_count = thread->SelfSuspend();
-          result = X_STATUS_SUCCESS;
+          result = thread->SelfSuspend(&suspend_count);
           XELOGD("Thread {:X} resumed", thread->handle());
         } else {
           result = thread->Suspend(&suspend_count);
@@ -294,7 +291,7 @@ dword_result_t NtSuspendThread_entry(dword_t handle,
     return X_STATUS_INVALID_HANDLE;
   }
 
-  if (suspend_count_ptr) {
+  if (suspend_count_ptr && XSUCCEEDED(result)) {
     *suspend_count_ptr = suspend_count;
   }
 
@@ -473,9 +470,9 @@ dword_result_t KeDelayExecutionThread_entry(dword_t processor_mode,
                                             dword_t alertable,
                                             lpqword_t interval_ptr,
                                             const ppc_context_t& context) {
+  // TODO(Ecredes): Verify whether a null interval should be treated as zero.
   uint64_t interval = interval_ptr ? static_cast<uint64_t>(*interval_ptr) : 0u;
-  return KeDelayExecutionThread(processor_mode, alertable,
-                                interval_ptr ? &interval : nullptr, context);
+  return KeDelayExecutionThread(processor_mode, alertable, &interval, context);
 }
 DECLARE_XBOXKRNL_EXPORT3(KeDelayExecutionThread, kThreading, kImplemented,
                          kBlocking, kHighFrequency);
@@ -725,6 +722,7 @@ DECLARE_XBOXKRNL_EXPORT2(NtClearEvent, kThreading, kImplemented,
 // https://msdn.microsoft.com/en-us/library/windows/hardware/ff552150(v=vs.85).aspx
 void KeInitializeSemaphore_entry(pointer_t<X_KSEMAPHORE> semaphore_ptr,
                                  dword_t count, dword_t limit) {
+  semaphore_ptr.Zero();
   semaphore_ptr->header.type = SemaphoreObject;
   semaphore_ptr->header.signal_state = (uint32_t)count;
   semaphore_ptr->limit = (uint32_t)limit;
@@ -823,7 +821,7 @@ dword_result_t NtReleaseSemaphore_entry(dword_t sem_handle,
   } else {
     result = X_STATUS_INVALID_HANDLE;
   }
-  if (previous_count_ptr) {
+  if (previous_count_ptr && XSUCCEEDED(result)) {
     *previous_count_ptr = (uint32_t)previous_count;
   }
 
@@ -896,6 +894,9 @@ dword_result_t NtCreateTimer_entry(
     lpdword_t handle_ptr, pointer_t<X_OBJECT_ATTRIBUTES> obj_attributes_ptr,
     dword_t timer_type) {
   // timer_type = NotificationTimer (0) or SynchronizationTimer (1)
+  if (timer_type > 1) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
 
   // Check for an existing timer with the same name.
   auto existing_object =
@@ -1251,9 +1252,8 @@ DECLARE_XBOXKRNL_EXPORT3(KeAcquireSpinLockAtRaisedIrql, kThreading,
 
 dword_result_t KeTryToAcquireSpinLockAtRaisedIrql_entry(
     pointer_t<X_KSPINLOCK> lock_ptr, const ppc_context_t& ppc_ctx) {
-  // Lock.
+  // A lock that's held, even by this processor, is refused with 0.
   auto lock = reinterpret_cast<uint32_t*>(lock_ptr.host_address());
-  assert_true(lock_ptr->prcb_of_owner != static_cast<uint32_t>(ppc_ctx->r[13]));
   PrefetchForCAS(lock);
   if (!ppc_ctx->processor->GuestAtomicCAS32(
           ppc_ctx, 0, static_cast<uint32_t>(ppc_ctx->r[13]),
@@ -1309,6 +1309,7 @@ void xeKfLowerIrql(PPCContext* ctx, unsigned char new_irql) {
   if (new_irql < 2) {
     // the called function does a ton of other stuff including changing the
     // irql and interrupt_related
+    kernel_state()->RunQueuedDpcs(ctx);
   }
 }
 // irql is supposed to be per thread afaik...
@@ -1620,70 +1621,25 @@ void KeInitializeDpc_entry(pointer_t<XDPC> dpc, lpvoid_t routine,
 DECLARE_XBOXKRNL_EXPORT2(KeInitializeDpc, kThreading, kImplemented, kSketchy);
 
 dword_result_t KeInsertQueueDpc_entry(pointer_t<XDPC> dpc, dword_t arg1,
-                                      dword_t arg2) {
-  uint32_t list_entry_ptr = dpc.guest_address() + 4;
+                                      dword_t arg2,
+                                      const ppc_context_t& ppc_context) {
+  if (!kernel_state()->QueueDpc(static_cast<uint32_t>(ppc_context->r[13]),
+                                dpc.guest_address())) {
+    return 0;
+  }
 
-  // Lock dispatcher.
-  auto global_lock = xe::global_critical_region::AcquireDirect();
-  auto dpc_list = kernel_state()->dpc_list();
-
-  // Prep DPC.
   dpc->arg1 = (uint32_t)arg1;
   dpc->arg2 = (uint32_t)arg2;
 
-  dpc_list->Insert(list_entry_ptr);
-
-  // Dispatch the DPC inline on the calling thread.  On real hardware DPCs
-  // are deferred to DISPATCH_IRQL on the target processor, but DPC routines
-  // access per-CPU state via r13 (KPCR) so they must run on a thread whose
-  // KPCR is valid for the target CPU.  The calling thread's KPCR satisfies
-  // this for the common case (desired_cpu_number == 0, meaning current CPU).
-  // Inline dispatch also avoids latency issues with shared work queues.
-  uint32_t routine = dpc->routine;
-  if (routine) {
-    auto thread = XThread::GetCurrentThread();
-    if (thread) {
-      auto thread_state = thread->thread_state();
-      auto ppc_context = thread_state->context();
-      auto kpcr = ppc_context->TranslateVirtualGPR<X_KPCR*>(ppc_context->r[13]);
-
-      // If we're already inside a DPC (reentrant KeInsertQueueDpc from a DPC
-      // routine), skip the impersonation — we're already at DISPATCH_IRQL.
-      bool already_in_dpc = kpcr->prcb_data.dpc_active != 0;
-
-      DPCImpersonationScope dpc_scope{};
-      if (!already_in_dpc) {
-        kernel_state()->BeginDPCImpersonation(ppc_context, dpc_scope);
-      }
-
-      uint64_t args[] = {dpc.guest_address(), (uint64_t)dpc->context,
-                         (uint64_t)arg1, (uint64_t)arg2};
-      kernel_state()->processor()->Execute(thread_state, routine, args,
-                                           xe::countof(args));
-
-      if (!already_in_dpc) {
-        kernel_state()->EndDPCImpersonation(ppc_context, dpc_scope);
-      }
-    }
-  }
-
+  // DPC routines use the KPCR, so they run on the thread that queued them, at
+  // once below DISPATCH_LEVEL or else once its IRQL drops.
+  kernel_state()->RunQueuedDpcs(ppc_context);
   return 1;
 }
 DECLARE_XBOXKRNL_EXPORT2(KeInsertQueueDpc, kThreading, kImplemented, kSketchy);
 
 dword_result_t KeRemoveQueueDpc_entry(pointer_t<XDPC> dpc) {
-  bool result = false;
-
-  uint32_t list_entry_ptr = dpc.guest_address() + 4;
-
-  auto global_lock = xe::global_critical_region::AcquireDirect();
-  auto dpc_list = kernel_state()->dpc_list();
-  if (dpc_list->IsQueued(list_entry_ptr)) {
-    dpc_list->Remove(list_entry_ptr);
-    result = true;
-  }
-
-  return result ? 1 : 0;
+  return kernel_state()->DequeueDpc(dpc.guest_address()) ? 1 : 0;
 }
 DECLARE_XBOXKRNL_EXPORT1(KeRemoveQueueDpc, kThreading, kImplemented);
 
@@ -1723,7 +1679,8 @@ void ExAcquireReadWriteLockExclusive_entry(pointer_t<X_ERWLOCK> lock_ptr,
   lock_ptr->writers_waiting_count++;
 
   xeKeKfReleaseSpinLock(ppc_context, &lock_ptr->spin_lock, old_irql);
-  xeKeWaitForSingleObject(&lock_ptr->writer_event, 7, 0, 0, nullptr);
+  xeKeWaitForSingleObject(&lock_ptr->writer_event, 7,
+                          X_KPROCESSOR_MODE::KernelMode, 0, nullptr);
 }
 DECLARE_XBOXKRNL_EXPORT2(ExAcquireReadWriteLockExclusive, kThreading,
                          kImplemented, kBlocking);
@@ -1761,7 +1718,8 @@ void ExAcquireReadWriteLockShared_entry(pointer_t<X_ERWLOCK> lock_ptr,
   lock_ptr->readers_waiting_count++;
 
   xeKeKfReleaseSpinLock(ppc_context, &lock_ptr->spin_lock, old_irql);
-  xeKeWaitForSingleObject(&lock_ptr->reader_semaphore, 7, 0, 0, nullptr);
+  xeKeWaitForSingleObject(&lock_ptr->reader_semaphore, 7,
+                          X_KPROCESSOR_MODE::KernelMode, 0, nullptr);
 }
 DECLARE_XBOXKRNL_EXPORT2(ExAcquireReadWriteLockShared, kThreading, kImplemented,
                          kBlocking);
@@ -1799,6 +1757,8 @@ void ExReleaseReadWriteLock_entry(pointer_t<X_ERWLOCK> lock_ptr,
   }
 
   if (!lock_ptr->readers_entry_count) {
+    // The exclusive owner is releasing, so hand the lock to the waiting
+    // readers, or else to a waiting writer.
     auto readers_waiting_count = lock_ptr->readers_waiting_count;
     if (readers_waiting_count) {
       lock_ptr->readers_waiting_count = 0;
@@ -1808,10 +1768,8 @@ void ExReleaseReadWriteLock_entry(pointer_t<X_ERWLOCK> lock_ptr,
                            readers_waiting_count, 0);
       return;
     }
-  }
-
-  auto readers_entry_count = --lock_ptr->readers_entry_count;
-  if (readers_entry_count) {
+  } else if (--lock_ptr->readers_entry_count) {
+    // Other readers still hold the lock.
     xeKeKfReleaseSpinLock(ppc_context, &lock_ptr->spin_lock, old_irql);
     return;
   }

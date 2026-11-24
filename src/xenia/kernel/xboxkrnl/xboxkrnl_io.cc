@@ -61,7 +61,8 @@ dword_result_t NtCreateFile_entry(lpdword_t handle_out, dword_t desired_access,
   vfs::Entry* root_entry = nullptr;
 
   // Compute path, possibly attrs relative.
-  auto target_path = util::TranslateAnsiPath(kernel_memory(), object_name);
+  auto target_path = std::string(StripDosDevicesPrefix(
+      util::TranslateAnsiPath(kernel_memory(), object_name)));
 
   // Enforce that the path is ASCII.
   if (!IsValidPath(target_path, false)) {
@@ -118,10 +119,11 @@ DECLARE_XBOXKRNL_EXPORT1(NtCreateFile, kFileSystem, kImplemented);
 dword_result_t NtOpenFile_entry(
     lpdword_t handle_out, dword_t desired_access,
     pointer_t<X_OBJECT_ATTRIBUTES> object_attributes,
-    pointer_t<X_IO_STATUS_BLOCK> io_status_block, dword_t open_options) {
+    pointer_t<X_IO_STATUS_BLOCK> io_status_block, dword_t share_access,
+    dword_t open_options) {
   return NtCreateFile_entry(
       handle_out, desired_access, object_attributes, io_status_block, nullptr,
-      0, 0, static_cast<uint32_t>(xe::vfs::FileDisposition::kOpen),
+      0, share_access, static_cast<uint32_t>(xe::vfs::FileDisposition::kOpen),
       open_options);
 }
 DECLARE_XBOXKRNL_EXPORT1(NtOpenFile, kFileSystem, kImplemented);
@@ -430,14 +432,13 @@ dword_result_t NtRemoveIoCompletion_entry(
   auto port =
       kernel_state()->object_table()->LookupObject<XIOCompletion>(handle);
   if (!port) {
-    status = X_STATUS_INVALID_HANDLE;
+    return X_STATUS_INVALID_HANDLE;
   }
 
-  uint64_t timeout_ticks =
-      timeout ? static_cast<uint32_t>(*timeout)
-              : static_cast<uint64_t>(std::numeric_limits<int64_t>::min());
+  uint64_t timeout_ticks = timeout ? static_cast<uint64_t>(*timeout) : 0;
   XIOCompletion::IONotification notification;
-  if (port->WaitForNotification(timeout_ticks, &notification)) {
+  if (port->WaitForNotification(timeout ? &timeout_ticks : nullptr,
+                                &notification)) {
     if (key_context) {
       *key_context = notification.key_context;
     }
@@ -484,7 +485,8 @@ dword_result_t NtQueryFullAttributesFile_entry(
     assert_always();
   }
 
-  auto target_path = util::TranslateAnsiPath(kernel_memory(), object_name);
+  auto target_path = std::string(StripDosDevicesPrefix(
+      util::TranslateAnsiPath(kernel_memory(), object_name)));
 
   // Enforce that the path is ASCII.
   if (!IsValidPath(target_path, false)) {
@@ -495,6 +497,7 @@ dword_result_t NtQueryFullAttributesFile_entry(
   auto entry = kernel_state()->file_system()->ResolvePath(target_path);
   if (entry) {
     // Found.
+    entry->update();
     file_info->creation_time = entry->create_timestamp();
     file_info->last_access_time = entry->access_timestamp();
     file_info->last_write_time = entry->write_timestamp();
@@ -506,7 +509,16 @@ dword_result_t NtQueryFullAttributesFile_entry(
     return X_STATUS_SUCCESS;
   }
 
-  return X_STATUS_NO_SUCH_FILE;
+  // A missing folder or drive on the way fails differently from a missing
+  // last name.
+  auto folder_path = xe::utf8::find_base_guest_path(target_path);
+
+  if (!folder_path.empty() &&
+      !kernel_state()->file_system()->ResolvePath(folder_path)) {
+    return X_STATUS_OBJECT_PATH_NOT_FOUND;
+  }
+
+  return X_STATUS_OBJECT_NAME_NOT_FOUND;
 }
 DECLARE_XBOXKRNL_EXPORT1(NtQueryFullAttributesFile, kFileSystem, kImplemented);
 
@@ -580,7 +592,8 @@ dword_result_t NtOpenSymbolicLinkObject_entry(
   auto object_name =
       kernel_memory()->TranslateVirtual<X_ANSI_STRING*>(object_attrs->name_ptr);
 
-  auto target_path = util::TranslateAnsiPath(kernel_memory(), object_name);
+  auto target_path = std::string(StripDosDevicesPrefix(
+      util::TranslateAnsiPath(kernel_memory(), object_name)));
 
   // Enforce that the path is ASCII.
   if (!IsValidPath(target_path, false)) {
@@ -591,14 +604,10 @@ dword_result_t NtOpenSymbolicLinkObject_entry(
     assert_always();
   }
 
-  if (utf8::starts_with(target_path, "\\??\\")) {
-    target_path = target_path.substr(4);  // Strip the full qualifier
-  }
-
   std::string link_path;
   if (!kernel_state()->file_system()->FindSymbolicLink(target_path,
                                                        link_path)) {
-    return X_STATUS_NO_SUCH_FILE;
+    return X_STATUS_OBJECT_NAME_NOT_FOUND;
   }
 
   object_ref<XSymbolicLink> symlink(new XSymbolicLink(kernel_state()));
@@ -611,15 +620,21 @@ dword_result_t NtOpenSymbolicLinkObject_entry(
 DECLARE_XBOXKRNL_EXPORT1(NtOpenSymbolicLinkObject, kFileSystem, kImplemented);
 
 // https://docs.microsoft.com/en-us/windows/win32/devnotes/ntquerysymboliclinkobject
-dword_result_t NtQuerySymbolicLinkObject_entry(
-    dword_t handle, pointer_t<X_ANSI_STRING> target) {
+dword_result_t NtQuerySymbolicLinkObject_entry(dword_t handle,
+                                               pointer_t<X_ANSI_STRING> target,
+                                               lpdword_t returned_length_ptr) {
   auto symlink =
       kernel_state()->object_table()->LookupObject<XSymbolicLink>(handle);
   if (!symlink) {
     return X_STATUS_NO_SUCH_FILE;
   }
-  auto length = std::min(static_cast<size_t>(target->maximum_length),
-                         symlink->target().size());
+  const auto length = static_cast<uint32_t>(symlink->target().size());
+  if (returned_length_ptr) {
+    *returned_length_ptr = length;
+  }
+  if (length > target->maximum_length) {
+    return X_STATUS_BUFFER_TOO_SMALL;
+  }
   if (length > 0) {
     auto target_buf = kernel_memory()->TranslateVirtual(target->pointer);
     std::memcpy(target_buf, symlink->target().c_str(), length);

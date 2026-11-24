@@ -55,9 +55,6 @@ namespace xe {
 namespace kernel {
 namespace xam {
 
-// https://github.com/tpn/winsdk-10/blob/master/Include/10.0.14393.0/km/wdm.h#L15539
-typedef enum _MODE { KernelMode, UserMode, MaximumMode } MODE;
-
 dword_result_t XamFeatureEnabled_entry(qword_t feature_bit) {
   const std::bitset<36> feature(0x40ffffffff);
   if (feature.test(feature_bit)) {
@@ -736,13 +733,13 @@ dword_result_t RtlSleep_entry(dword_t dwMilliseconds, dword_t bAlertable) {
   delay = dwMilliseconds == -1 ? LLONG_MAX
                                : static_cast<int64_t>(-10000) * dwMilliseconds;
 
-  X_STATUS result = xboxkrnl::KeDelayExecutionThread(MODE::UserMode, bAlertable,
-                                                     &delay, nullptr);
+  X_STATUS result = xboxkrnl::KeDelayExecutionThread(
+      X_KPROCESSOR_MODE::UserMode, bAlertable, &delay, nullptr);
 
   // If the delay was interrupted by an APC, keep delaying the thread
   while (bAlertable && result == X_STATUS_ALERTED) {
-    result = xboxkrnl::KeDelayExecutionThread(MODE::UserMode, bAlertable,
-                                              &delay, nullptr);
+    result = xboxkrnl::KeDelayExecutionThread(X_KPROCESSOR_MODE::UserMode,
+                                              bAlertable, &delay, nullptr);
   }
 
   return result == X_STATUS_SUCCESS ? X_STATUS_SUCCESS : X_STATUS_USER_APC;
@@ -794,7 +791,7 @@ DECLARE_XAM_EXPORT1(GetLastError, kNone, kImplemented);
 dword_result_t GetModuleHandleA_entry(lpstring_t module_name) {
   xe::be<uint32_t> module_ptr = 0;
   const X_STATUS error_code = xe::kernel::xboxkrnl::XexGetModuleHandle(
-      module_name.value(), &module_ptr);
+      module_name ? module_name.value() : "", &module_ptr);
 
   if (XFAILED(error_code)) {
     RtlSetLastNTError_entry(error_code);
@@ -879,35 +876,37 @@ dword_result_t GetCurrentThreadId_entry() {
 }
 DECLARE_XAM_EXPORT1(GetCurrentThreadId, kNone, kImplemented);
 
-qword_result_t XapiFormatTimeOut_entry(lpqword_t result,
+dword_result_t XapiFormatTimeOut_entry(lpqword_t result,
                                        dword_t dwMilliseconds) {
-  if (dwMilliseconds == -1) {
+  auto timeout = XObject::MsToTimeoutTicks(dwMilliseconds);
+  if (!timeout) {
     return 0;
   }
 
-  *result = static_cast<int64_t>(-10000) * dwMilliseconds;
-  return result.host_address();
+  *result = static_cast<uint64_t>(*timeout);
+  return result.guest_address();
 }
 DECLARE_XAM_EXPORT1(XapiFormatTimeOut, kNone, kImplemented);
 
 dword_result_t WaitForSingleObjectEx_entry(dword_t hHandle,
                                            dword_t dwMilliseconds,
                                            dword_t bAlertable) {
-  // TODO(Gliniak): Figure it out to be less janky.
-  uint64_t timeout;
-  uint64_t* timeout_ptr = reinterpret_cast<uint64_t*>(
-      static_cast<uint64_t>(XapiFormatTimeOut_entry(&timeout, dwMilliseconds)));
+  auto timeout = XObject::MsToTimeoutTicks(dwMilliseconds);
+  uint64_t timeout_ticks = timeout ? static_cast<uint64_t>(*timeout) : 0;
+  uint64_t* timeout_ptr = timeout ? &timeout_ticks : nullptr;
 
-  X_STATUS result =
-      xboxkrnl::NtWaitForSingleObjectEx(hHandle, 1, bAlertable, timeout_ptr);
+  X_STATUS result = xboxkrnl::NtWaitForSingleObjectEx(
+      hHandle, X_KPROCESSOR_MODE::UserMode, bAlertable, timeout_ptr);
 
   while (bAlertable && result == X_STATUS_ALERTED) {
-    result =
-        xboxkrnl::NtWaitForSingleObjectEx(hHandle, 1, bAlertable, timeout_ptr);
+    result = xboxkrnl::NtWaitForSingleObjectEx(
+        hHandle, X_KPROCESSOR_MODE::UserMode, bAlertable, timeout_ptr);
   }
 
-  RtlSetLastNTError_entry(result);
-  result = -1;
+  if (XFAILED(result)) {
+    RtlSetLastNTError_entry(result);
+    return -1;
+  }
 
   return result;
 }

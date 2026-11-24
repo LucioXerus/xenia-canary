@@ -10,6 +10,7 @@
 #ifndef XENIA_CPU_BACKEND_X64_X64_BACKEND_H_
 #define XENIA_CPU_BACKEND_X64_X64_BACKEND_H_
 
+#include <atomic>
 #include <memory>
 
 #include "xenia/base/bit_map.h"
@@ -43,6 +44,11 @@ class X64AOTCache;
 typedef void* (*HostToGuestThunk)(void* target, void* arg0, void* arg1);
 typedef void* (*GuestToHostThunk)(void* target, void* arg0, void* arg1);
 typedef void (*ResolveFunctionThunk)();
+// Host entry to a stwcx. helper, returns 1 if the store landed. The value is
+// guest endian.
+typedef uint32_t (*ReservedStoreThunk)(uint32_t guest_address,
+                                       ppc::PPCContext* context, uint64_t value,
+                                       void* host_address);
 
 /*
     place guest trampolines in the memory range that the HV normally occupies.
@@ -58,16 +64,28 @@ static constexpr uint32_t GUEST_TRAMPOLINE_MIN_LEN = 8;
 static constexpr uint32_t MAX_GUEST_TRAMPOLINES =
     (GUEST_TRAMPOLINE_END - GUEST_TRAMPOLINE_BASE) / GUEST_TRAMPOLINE_MIN_LEN;
 
-#define RESERVE_BLOCK_SHIFT 16
-
-#define RESERVE_NUM_ENTRIES \
-  ((1024ULL * 1024ULL * 1024ULL * 4ULL) >> RESERVE_BLOCK_SHIFT)
 // https://codalogic.com/blog/2022/12/06/Exploring-PowerPCs-read-modify-write-operations
-struct ReserveHelper {
-  uint64_t blocks[RESERVE_NUM_ENTRIES / 64];
+// Xenon reservation granule is one 128 byte cache line.
+static constexpr uint32_t RESERVE_GRANULE_SHIFT = 7;
+// A generation counter per granule, hashed. stwcx. makes it odd while it
+// stores, then moves it on to the next even value to kill other threads'
+// reservations. Colliding granules only cost a spurious failure. Other stwcx.
+// on the granule fail while it's odd, so a thread suspended or terminated
+// mid-store holds them off until it resumes.
+static constexpr uint32_t RESERVE_NUM_ENTRIES = 1u << 20;
+static constexpr uint32_t RESERVE_ENTRY_MASK = RESERVE_NUM_ENTRIES - 1;
 
-  ReserveHelper() { memset(blocks, 0, sizeof(blocks)); }
+struct ReserveHelper {
+  std::atomic<uint32_t> generations[RESERVE_NUM_ENTRIES];
+
+  ReserveHelper() {
+    for (auto& generation : generations) {
+      generation.store(0, std::memory_order_relaxed);
+    }
+  }
 };
+// emitted code indexes the table with a hardcoded 4 byte stride
+static_assert(sizeof(std::atomic<uint32_t>) == sizeof(uint32_t));
 
 struct X64BackendStackpoint {
   uint64_t host_stack_;
@@ -84,6 +102,9 @@ enum : uint32_t {
       2,  // non-java mode bit is currently set. for use in software fp routines
   kX64BackendNonIEEEMode =
       3,  // non-ieee mode is currently enabled for scalar fpu.
+  // ResolveFunction sent a longjmp to a return site, for
+  // EmitGuestAndHostSynchronizeStackHelper to put rsp back in its frame.
+  kX64BackendLongjmpPendingBit = 4,
 };
 // located prior to the ctx register
 // some things it would be nice to have be per-emulator instance instead of per
@@ -101,8 +122,9 @@ struct X64BackendContext {
   uint64_t* guest_tick_count;
   // records mapping of host_stack to guest_stack
   X64BackendStackpoint* stackpoints;
-  uint64_t cached_reserve_offset;
-  uint32_t cached_reserve_bit;
+  // address of the live reservation, and its granule generation when taken
+  uint32_t reserve_address;
+  uint32_t reserve_generation;
   unsigned int current_stackpoint_depth;
   unsigned int mxcsr_fpu;  // currently, the way we implement rounding mode
                            // affects both vmx and the fpu
@@ -175,6 +197,8 @@ class X64Backend : public Backend {
     return reinterpret_cast<X64BackendContext*>(
         reinterpret_cast<intptr_t>(ctx) - sizeof(X64BackendContext));
   }
+  // lwarx found the granule claimed, refreshes the generation it took.
+  static uint64_t AwaitReservation(void* raw_context, uint64_t guest_address);
   virtual uint32_t CreateGuestTrampoline(GuestTrampolineProc proc,
                                          void* userdata1, void* userdata2,
                                          bool long_term) override;
@@ -198,12 +222,20 @@ class X64Backend : public Backend {
   void* LookupXMMConstantAddress(unsigned index) {
     return reinterpret_cast<void*>(emitter_data() + sizeof(vec128_t) * index);
   }
+
+  uint32_t ReservedLoad32(ppc::PPCContext* context, uint32_t address) override;
+  uint64_t ReservedLoad64(ppc::PPCContext* context, uint32_t address) override;
+  bool ReservedStore32(ppc::PPCContext* context, uint32_t address,
+                       uint32_t value) override;
+  bool ReservedStore64(ppc::PPCContext* context, uint32_t address,
+                       uint64_t value) override;
 #if XE_X64_PROFILER_AVAILABLE == 1
   uint64_t* GetProfilerRecordForFunction(uint32_t guest_address);
 #endif
  private:
   static bool ExceptionCallbackThunk(Exception* ex, void* data);
   bool ExceptionCallback(Exception* ex);
+  static uint64_t ReleaseFaultingReservedStore(void* data, Exception* ex);
 
   uintptr_t capstone_handle_ = 0;
 
@@ -225,6 +257,9 @@ class X64Backend : public Backend {
   void* try_acquire_reservation_helper_ = nullptr;
   void* reserved_store_32_helper = nullptr;
   void* reserved_store_64_helper = nullptr;
+  ReservedStoreThunk reserved_store_32_thunk_ = nullptr;
+  ReservedStoreThunk reserved_store_64_thunk_ = nullptr;
+  ReservedStoreFaultSite reserved_store_fault_sites_[2] = {};
   void* vrsqrtefp_vector_helper = nullptr;
   void* vrsqrtefp_scalar_helper = nullptr;
   void* frsqrtefp_helper = nullptr;

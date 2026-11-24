@@ -153,12 +153,12 @@ void UpdaterDialog::OnDraw(ImGuiIO& io) {
   if (ImGui::BeginPopupModal(
           "Updater", &updater_opened_,
           ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove)) {
-    ImGui::SetWindowFontScale(1.05f);
+    ImGui::PushFont(nullptr, imgui_drawer()->GetFontSize() * 1.05f);
 
 #ifdef DEBUG
     ImGui::Text("This is a debug build, therefore updates are unavailable.");
 
-    ImGui::SetWindowFontScale(1.0f);
+    ImGui::PopFont();
 
     ImGui::EndPopup();
   }
@@ -248,7 +248,7 @@ void UpdaterDialog::OnDraw(ImGuiIO& io) {
     float lbl_align_x = region_max - total_width;
     ImGui::SetCursorPosX(lbl_align_x);
 
-    ImGui::Text(toggle_lbl.c_str());
+    ImGui::Text("%s", toggle_lbl.c_str());
 
     ImGui::EndGroup();
 
@@ -307,7 +307,7 @@ void UpdaterDialog::OnDraw(ImGuiIO& io) {
 
         ImGui::BeginChild("##ChangelogChild", ImVec2(-1, height),
                           ImGuiChildFlags_Borders);
-        ImGui::TextWrapped(changelog_.c_str());
+        ImGui::TextWrapped("%s", changelog_.c_str());
         ImGui::EndChild();
         const ImVec2 item_size = ImGui::GetItemRectSize();
         const ImVec2 end_pos = ImVec2(muli_input_text_pos.x + item_size.x,
@@ -316,7 +316,7 @@ void UpdaterDialog::OnDraw(ImGuiIO& io) {
         ImDrawList* draw_list = ImGui::GetWindowDrawList();
 
         draw_list->AddRect(muli_input_text_pos, end_pos,
-                           IM_COL32(50, 96, 168, 200), 0.0f, 0, 3.0f);
+                           IM_COL32(50, 96, 168, 200), 0.0f, 3.0f);
       }
 
       if (stable_toggle_) {
@@ -366,8 +366,8 @@ void UpdaterDialog::OnDraw(ImGuiIO& io) {
         std::string error_code = fmt::format(
             "Error Code: {}", static_cast<int32_t>(download_response_code_));
 
-        ImGui::Text(dl_failed_desc.c_str());
-        ImGui::Text(error_code.c_str());
+        ImGui::Text("%s", dl_failed_desc.c_str());
+        ImGui::Text("%s", error_code.c_str());
       }
 
       if (!hide_download_button_) {
@@ -463,7 +463,7 @@ void UpdaterDialog::OnDraw(ImGuiIO& io) {
         ImVec2 desc_size = ImGui::CalcTextSize(desc.c_str());
 
         ImGui::SetCursorPosX((ImGui::GetWindowWidth() - desc_size.x) * 0.5f);
-        ImGui::Text(desc.c_str());
+        ImGui::Text("%s", desc.c_str());
         ImGui::Separator();
 
         std::string yes_lbl = "Yes";
@@ -586,8 +586,9 @@ void UpdaterDialog::OnDraw(ImGuiIO& io) {
           ImGui::Text("Build Details:");
           ImGui::TextWrapped(
               fmt::format("Branch: {}", XE_BUILD_BRANCH).c_str());
-          ImGui::Text(fmt::format("Date: {}", XE_BUILD_DATE).c_str());
-          ImGui::Text(fmt::format("Commit: {}", XE_BUILD_COMMIT_SHORT).c_str());
+          ImGui::Text("%s", fmt::format("Date: {}", XE_BUILD_DATE).c_str());
+          ImGui::Text("%s",
+                      fmt::format("Commit: {}", XE_BUILD_COMMIT_SHORT).c_str());
 
           ImGui::Spacing();
         } break;
@@ -618,13 +619,13 @@ void UpdaterDialog::OnDraw(ImGuiIO& io) {
 
           ImGui::Spacing();
           ImGui::Text("Failed to check for updates!");
-          ImGui::Text(error_code.c_str());
+          ImGui::Text("%s", error_code.c_str());
           ImGui::Spacing();
         } break;
       }
     }
 
-    ImGui::SetWindowFontScale(1.0f);
+    ImGui::PopFont();
 
     ImGui::EndPopup();
   }
@@ -701,7 +702,7 @@ void UpdaterCompletionDialog::OnDraw(ImGuiIO& io) {
     float btn_width = (ImGui::GetContentRegionAvail().x * 0.5f) -
                       (ImGui::GetStyle().ItemSpacing.x * 0.5f);
 
-    ImGui::SetWindowFontScale(1.05f);
+    ImGui::PushFont(nullptr, imgui_drawer()->GetFontSize() * 1.05f);
 
     if (!updated_) {
       const std::string desc = "Automatic update failed.";
@@ -710,7 +711,7 @@ void UpdaterCompletionDialog::OnDraw(ImGuiIO& io) {
       ImGui::SetCursorPosX((ImGui::GetWindowWidth() - desc_size.x) * 0.5f);
 
       ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(240, 50, 50, 255));
-      ImGui::Text(desc.c_str());
+      ImGui::Text("%s", desc.c_str());
       ImGui::PopStyleColor();
 
       ImGui::Separator();
@@ -775,7 +776,7 @@ void UpdaterCompletionDialog::OnDraw(ImGuiIO& io) {
           log.close();
         } else {
           ImGui::Text(
-              fmt::format("{} not found.", update_log_filename_).c_str());
+              "%s", fmt::format("{} not found.", update_log_filename_).c_str());
           ImGui::Separator();
           ImGui::Spacing();
         }
@@ -784,7 +785,7 @@ void UpdaterCompletionDialog::OnDraw(ImGuiIO& io) {
 
         ImGui::BeginChild("##UpdatelogChild", ImVec2(-1, height),
                           ImGuiChildFlags_Borders);
-        ImGui::TextWrapped(buffer.str().c_str());
+        ImGui::TextWrapped("%s", buffer.str().c_str());
         ImGui::EndChild();
         const ImVec2 item_size = ImGui::GetItemRectSize();
         const ImVec2 end_pos = ImVec2(muli_input_text_pos.x + item_size.x,
@@ -793,7 +794,7 @@ void UpdaterCompletionDialog::OnDraw(ImGuiIO& io) {
         ImDrawList* draw_list = ImGui::GetWindowDrawList();
 
         draw_list->AddRect(muli_input_text_pos, end_pos,
-                           IM_COL32(50, 96, 168, 200), 0.0f, 0, 3.0f);
+                           IM_COL32(50, 96, 168, 200), 0.0f, 3.0f);
 
         std::string copy_btn = "";
 
@@ -832,12 +833,13 @@ void UpdaterCompletionDialog::OnDraw(ImGuiIO& io) {
 
       ImGui::Text("To update Xenia Canary manually:");
       ImGui::Text(
+          "%s",
           fmt::format("1. Extract the zip file: {}", artifact_name_).c_str());
       ImGui::Text("2. Replace the current Xenia executable with the new one.");
       ImGui::Text("3. Delete the zip file.");
     }
 
-    ImGui::SetWindowFontScale(1.0f);
+    ImGui::PopFont();
 
     ImGui::EndPopup();
   }

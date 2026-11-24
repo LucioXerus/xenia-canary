@@ -14,10 +14,7 @@
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
 #include "xenia/kernel/xthread.h"
-#include "xenia/ui/imgui_dialog.h"
-#include "xenia/ui/imgui_drawer.h"
-#include "xenia/ui/window.h"
-#include "xenia/ui/windowed_app_context.h"
+#include "xenia/ui/imgui_crash_dialog.h"
 
 namespace xe {
 namespace kernel {
@@ -26,138 +23,43 @@ namespace xboxkrnl {
 void DbgBreakPoint_entry() { xe::debugging::Break(); }
 DECLARE_XBOXKRNL_EXPORT2(DbgBreakPoint, kDebug, kStub, kImportant);
 
-// https://msdn.microsoft.com/en-us/library/xcb2z8hs.aspx
-typedef struct {
-  xe::be<uint32_t> type;
-  xe::be<uint32_t> name_ptr;
-  xe::be<uint32_t> thread_id;
-  xe::be<uint32_t> flags;
-} X_THREADNAME_INFO;
-static_assert_size(X_THREADNAME_INFO, 0x10);
-
-void HandleSetThreadName(pointer_t<X_EXCEPTION_RECORD> record) {
-  // SetThreadName. FFS.
-  // https://msdn.microsoft.com/en-us/library/xcb2z8hs.aspx
-
-  // TODO(benvanik): check record->number_parameters to make sure it's a
-  // correct size.
-  auto thread_info =
-      reinterpret_cast<X_THREADNAME_INFO*>(&record->exception_information[0]);
-
-  assert_true(thread_info->type == 0x1000);
-
-  if (!thread_info->name_ptr) {
-    XELOGD("SetThreadName called with null name_ptr");
-    return;
+static const char* GetBugCheckDescription(uint32_t code) {
+  switch (code) {
+    case 0x0000001E:
+      return "Kernel exception not handled";
+    case 0x00000032:
+      return "Initialization failed";
+    case 0x00000035:
+      return "No more IRP stack locations";
+    case 0x00000044:
+      return "IRP completed more than once";
+    case 0x000000F2:
+      return "Stack buffer overrun or fatal trap";
+    case 0x000000F4:
+      return "Heap check failed";
+    case 0x000000F6:
+      return "Devkit-only function called";
+    default:
+      return nullptr;
   }
-
-  // 4D5307D6 (and its demo) has a bug where it ends up passing freed memory for
-  // the name, so at the point of SetThreadName it's filled with junk.
-
-  // TODO(gibbed): cvar for thread name encoding for conversion, some games use
-  // SJIS and there's no way to automatically know this.
-  auto name = std::string(
-      kernel_memory()->TranslateVirtual<const char*>(thread_info->name_ptr));
-  std::ranges::replace_if(name, [](auto c) { return c < 32 || c > 127; }, '?');
-
-  object_ref<XThread> thread;
-  if (thread_info->thread_id == -1) {
-    // Current thread.
-    thread = retain_object(XThread::GetCurrentThread());
-  } else {
-    // Lookup thread by ID.
-    thread = kernel_state()->GetThreadByID(thread_info->thread_id);
-  }
-
-  if (thread) {
-    XELOGD("SetThreadName({}, {})", thread->thread_id(), name);
-    thread->set_name(name);
-  }
-
-  // TODO(benvanik): unwinding required here?
 }
-
-typedef struct {
-  xe::be<int32_t> mdisp;
-  xe::be<int32_t> pdisp;
-  xe::be<int32_t> vdisp;
-} x_PMD;
-
-typedef struct {
-  xe::be<uint32_t> properties;
-  xe::be<uint32_t> type_ptr;
-  x_PMD this_displacement;
-  xe::be<int32_t> size_or_offset;
-  xe::be<uint32_t> copy_function_ptr;
-} x_s__CatchableType;
-
-typedef struct {
-  xe::be<int32_t> number_catchable_types;
-  xe::be<uint32_t> catchable_type_ptrs[1];
-} x_s__CatchableTypeArray;
-
-typedef struct {
-  xe::be<uint32_t> attributes;
-  xe::be<uint32_t> unwind_ptr;
-  xe::be<uint32_t> forward_compat_ptr;
-  xe::be<uint32_t> catchable_type_array_ptr;
-} x_s__ThrowInfo;
-
-void HandleCppException(pointer_t<X_EXCEPTION_RECORD> record) {
-  // C++ exception.
-  // https://blogs.msdn.com/b/oldnewthing/archive/2010/07/30/10044061.aspx
-  // http://www.drdobbs.com/visual-c-exception-handling-instrumentat/184416600
-  // http://www.openrce.org/articles/full_view/21
-
-  assert_true(record->number_parameters == 3);
-  assert_true(record->exception_information[0] == 0x19930520);
-
-  auto thrown_ptr = record->exception_information[1];
-  auto thrown = kernel_memory()->TranslateVirtual(thrown_ptr);
-  auto vftable_ptr = *reinterpret_cast<xe::be<uint32_t>*>(thrown);
-
-  auto throw_info_ptr = record->exception_information[2];
-  auto throw_info =
-      kernel_memory()->TranslateVirtual<x_s__ThrowInfo*>(throw_info_ptr);
-  auto catchable_types =
-      kernel_memory()->TranslateVirtual<x_s__CatchableTypeArray*>(
-          throw_info->catchable_type_array_ptr);
-
-  // xe::debugging::Break();
-  XELOGE("Guest attempted to throw a C++ exception!");
-}
-
-void RtlRaiseException_entry(pointer_t<X_EXCEPTION_RECORD> record) {
-  switch (record->code) {
-    case 0x406D1388: {
-      HandleSetThreadName(record);
-      return;
-    }
-    case 0xE06D7363: {
-      HandleCppException(record);
-      return;
-    }
-  }
-
-  // TODO(benvanik): unwinding.
-  // This is going to suck.
-  // xe::debugging::Break();
-
-  // RtlRaiseException definitely wasn't a noreturn function, we can return
-  // safe-ish
-  XELOGE("Guest attempted to trigger a breakpoint!");
-}
-DECLARE_XBOXKRNL_EXPORT2(RtlRaiseException, kDebug, kStub, kImportant);
 
 void KeBugCheckEx_entry(dword_t code, dword_t param1, dword_t param2,
                         dword_t param3, dword_t param4) {
+  const char* description = GetBugCheckDescription(code);
+
   auto msg =
       fmt::format("*** STOP: 0x{:08X} (0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X})",
                   static_cast<uint32_t>(code), static_cast<uint32_t>(param1),
                   static_cast<uint32_t>(param2), static_cast<uint32_t>(param3),
                   static_cast<uint32_t>(param4));
+
+  if (description) {
+    msg = fmt::format("{} - {}", msg, description);
+  }
+
   XELOGE("{}", msg);
-  fflush(stdout);
+  FlushLog();
 
   if (xe::debugging::IsDebuggerAttached()) {
     xe::debugging::Break();
@@ -166,20 +68,40 @@ void KeBugCheckEx_entry(dword_t code, dword_t param1, dword_t param2,
   // Show crash dialog and suspend the guest thread instead of killing the
   // host process.
   auto current_thread = kernel::XThread::GetCurrentThread();
-  const auto* emulator = kernel_state()->emulator();
-  auto* display_window = emulator->display_window();
-  auto* imgui_drawer = emulator->imgui_drawer();
-  if (display_window && imgui_drawer) {
-    auto dlg_msg = fmt::format(
-        "The guest kernel has crashed (KeBugCheck).\n\n{}\n\n"
-        "The faulting thread has been suspended.",
-        msg);
-    display_window->app_context().CallInUIThreadSynchronous(
-        [imgui_drawer, &dlg_msg]() {
-          xe::ui::ImGuiDialog::ShowMessageBox(imgui_drawer,
-                                              "Guest Kernel Crash", dlg_msg);
-        });
+
+  xe::ui::CrashReport report;
+  report.heading = "The game's kernel has crashed";
+  report.description =
+      "The game stopped itself with a bug check and the thread that raised "
+      "it has been suspended. Attach the log when reporting this crash.";
+
+  std::string stop_code = fmt::format("0x{:08X}", static_cast<uint32_t>(code));
+
+  if (description) {
+    stop_code = fmt::format("{} ({})", stop_code, description);
   }
+
+  report.details.emplace_back("Stop code", stop_code);
+  report.details.emplace_back(
+      "Parameters",
+      fmt::format("0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X}",
+                  static_cast<uint32_t>(param1), static_cast<uint32_t>(param2),
+                  static_cast<uint32_t>(param3),
+                  static_cast<uint32_t>(param4)));
+
+  if (current_thread) {
+    report.details.emplace_back(
+        "Thread",
+        fmt::format("0x{:08X} (host 0x{:08X})", current_thread->thread_id(),
+                    current_thread->thread()->system_id()));
+
+    // Return address of the KeBugCheck call.
+    const uint32_t caller =
+        static_cast<uint32_t>(current_thread->thread_state()->context()->lr);
+    report.details.emplace_back("Caller", fmt::format("0x{:08X}", caller));
+  }
+
+  kernel_state()->emulator()->ShowCrashDialog(std::move(report));
 
   if (current_thread) {
     current_thread->Suspend(nullptr);

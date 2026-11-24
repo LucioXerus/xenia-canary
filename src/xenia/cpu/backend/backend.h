@@ -10,6 +10,7 @@
 #ifndef XENIA_CPU_BACKEND_BACKEND_H_
 #define XENIA_CPU_BACKEND_BACKEND_H_
 
+#include <atomic>
 #include <memory>
 
 #include "xenia/cpu/backend/machine_info.h"
@@ -137,6 +138,16 @@ class Backend {
   // .xaot files keyed by executable module SHA. Default is a no-op.
   virtual void FlushAllPendingAOT() {}
 
+  // lwarx/stwcx. for host code, on the same reservation state the JIT uses, so
+  // a host store cancels a guest thread's reservation. Values are guest endian.
+  // The defaults are a host compare-exchange on the value.
+  virtual uint32_t ReservedLoad32(ppc::PPCContext* context, uint32_t address);
+  virtual uint64_t ReservedLoad64(ppc::PPCContext* context, uint32_t address);
+  virtual bool ReservedStore32(ppc::PPCContext* context, uint32_t address,
+                               uint32_t value);
+  virtual bool ReservedStore64(ppc::PPCContext* context, uint32_t address,
+                               uint64_t value);
+
  protected:
   Processor* processor_ = nullptr;
   MachineInfo machine_info_;
@@ -179,6 +190,19 @@ struct GuestTrampolineGroup
     return _NewTrampoline(proc, false);
   }
 };
+
+// Where a stwcx. helper touches guest memory while it holds the granule claim,
+// and the exit that fails it without publishing again.
+struct ReservedStoreFaultSite {
+  uint64_t first_access;
+  uint64_t last_access;
+  uint64_t fail;
+};
+
+// lwarx on a granule a stwcx. has claimed waits a bounded time for the publish,
+// then yields the host thread in case the claimer was preempted. Returns the
+// generation last read, still odd if the claim outlasted the wait.
+uint32_t AwaitReserveGranule(const std::atomic<uint32_t>& granule);
 
 }  // namespace backend
 }  // namespace cpu

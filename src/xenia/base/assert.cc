@@ -24,8 +24,9 @@
 #if XE_PLATFORM_GNU_LINUX
 #include <dlfcn.h>
 
-// Use headers in third party to not depend on system sdl headers for building
-#include "third_party/SDL2/include/SDL.h"
+#include "xenia/base/system.h"
+
+#include <SDL3/SDL.h>
 #endif
 
 namespace xe {
@@ -41,17 +42,14 @@ thread_local bool in_assert = false;
 // Equivalent of the MSVC debug CRT assertion dialog. SDL is loaded dynamically
 // like in ShowSimpleMessageBox, as xenia-base doesn't link it.
 AssertAction ShowAssertDialog(const std::string& message) {
-  void* libsdl2 = dlopen("libSDL2-2.0.so.0", RTLD_LAZY | RTLD_LOCAL);
-  if (!libsdl2) {
-    libsdl2 = dlopen("libSDL2.so", RTLD_LAZY | RTLD_LOCAL);
-  }
-  if (!libsdl2) {
+  void* libsdl3 = LoadSDL3Library();
+  if (!libsdl3) {
     return AssertAction::kIgnore;
   }
 
   AssertAction action = AssertAction::kIgnore;
   auto* pSDL_ShowMessageBox = reinterpret_cast<decltype(SDL_ShowMessageBox)*>(
-      dlsym(libsdl2, "SDL_ShowMessageBox"));
+      dlsym(libsdl3, "SDL_ShowMessageBox"));
   if (pSDL_ShowMessageBox) {
     const SDL_MessageBoxButtonData buttons[] = {
         {0, static_cast<int>(AssertAction::kAbort), "Abort"},
@@ -68,11 +66,11 @@ AssertAction ShowAssertDialog(const std::string& message) {
                                      buttons,
                                      nullptr};
     int button_id = static_cast<int>(AssertAction::kIgnore);
-    if (pSDL_ShowMessageBox(&data, &button_id) == 0 && button_id >= 0) {
+    if (pSDL_ShowMessageBox(&data, &button_id) && button_id >= 0) {
       action = static_cast<AssertAction>(button_id);
     }
   }
-  dlclose(libsdl2);
+  dlclose(libsdl3);
   return action;
 }
 #else

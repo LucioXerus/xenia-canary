@@ -231,7 +231,7 @@ void TitleGamerpicBrowser::OnDraw(ImGuiIO& io) {
 
         ImGui::TableNextColumn();
 
-        ImGui::Text(lbl_games_pre_page.c_str());
+        ImGui::Text("%s", lbl_games_pre_page.c_str());
 
         ImGui::TableNextColumn();
         ImGui::SetNextItemWidth(item_width);
@@ -474,14 +474,14 @@ void TitleGamerpicBrowser::OnDraw(ImGuiIO& io) {
 
         // Height must be constant to ensure gamepad navigation between images
         // buttons is consistent.
+        ImGui::PushFont(nullptr, imgui_drawer()->GetFontSize() * 1.1f);
         if (ImGui::BeginChild(
                 fmt::format("##TitleContainer{:08X}", title.id).c_str(),
-                ImVec2(-1, 30))) {
-          ImGui::SetWindowFontScale(1.1f);
-          ImGui::TextWrapped(title.name.c_str());
-          ImGui::SetWindowFontScale(1.0f);
+                ImVec2(-1, 36))) {
+          ImGui::TextWrapped("%s", title.name.c_str());
         }
         ImGui::EndChild();
+        ImGui::PopFont();
 
         ImVec2 btn_gamerpic_centre = {};
 
@@ -844,12 +844,10 @@ void TitleGamerpicBrowser::DrawInputTextBoxWithHint(
 
     switch (on_input_change({buffer, buffer_size})) {
       case TitleIDInputState::NOT_FOUND:
-        draw_list->AddRect(input_field_pos, end_pos, IM_COL32(255, 0, 0, 200),
-                           0.0f, 0, 2.0f);
+        draw_list->AddRect(input_field_pos, end_pos, IM_COL32(255, 0, 0, 200), 0.0f, 2.0f);
         break;
       case TitleIDInputState::FOUND:
-        draw_list->AddRect(input_field_pos, end_pos, IM_COL32(0, 255, 0, 200),
-                           0.0f, 0, 2.0f);
+        draw_list->AddRect(input_field_pos, end_pos, IM_COL32(0, 255, 0, 200), 0.0f, 2.0f);
         break;
       case TitleIDInputState::EMPTY:
       default:

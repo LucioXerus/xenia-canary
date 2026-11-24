@@ -11,6 +11,7 @@
 #define XENIA_KERNEL_XAM_USER_SETTINGS_H_
 
 #include <array>
+#include <optional>
 #include <set>
 #include <variant>
 #include <vector>
@@ -495,6 +496,27 @@ enum GAMERCARD_ZONE_OPTIONS : uint32_t {
   GAMERCARD_ZONE_FAMILY,
   GAMERCARD_ZONE_UNDERGROUND
 };
+
+// Preferences are bit fields packed into XPROFILE_USER_PREFERENCES in the
+// dashboard GPD. Multi-bit preferences reserve one of their bits to mark the
+// field as having been written. Returns nullopt for unknown preference masks.
+constexpr std::optional<uint32_t> GetUserPreferenceWrittenBit(uint32_t mask) {
+  switch (mask) {
+    case 0x001:
+    case 0x020:
+    case 0x040:
+    case 0x080:
+    case 0x100:
+    case 0x200:
+      return 0;
+    case 0x006:
+      return 0x004;
+    case 0x018:
+      return 0x010;
+    default:
+      return std::nullopt;
+  }
+}
 
 struct GamerPictureKey {
   char title_id[8];

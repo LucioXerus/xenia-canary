@@ -635,6 +635,11 @@ dword_result_t NetDll_WSAWaitForMultipleEvents_entry(dword_t num_events,
   }
 
   X_STATUS result = 0;
+  do {
+    result = xboxkrnl::xeNtWaitForMultipleObjectsEx(
+        num_events, events, wait_all, X_KPROCESSOR_MODE::UserMode, alertable,
+        timeout != -1 ? &timeout_wait : nullptr);
+  } while (result == X_STATUS_ALERTED);
 
   while (true) {
     result = xboxkrnl::xeNtWaitForMultipleObjectsEx(

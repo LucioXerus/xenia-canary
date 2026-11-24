@@ -8,7 +8,9 @@
  */
 
 #include "xenia/gpu/d3d12/d3d12_command_processor.h"
+#include <chrono>
 #include <cstring>
+#include <thread>
 #include "xenia/apu/audio_system.h"
 #include "xenia/base/assert.h"
 #include "xenia/base/byte_order.h"
@@ -93,12 +95,13 @@ void D3D12CommandProcessor::TracePlaybackWroteMemory(uint32_t base_ptr,
   primitive_processor_->MemoryInvalidationCallback(base_ptr, length, true);
 }
 
-void D3D12CommandProcessor::RestoreEdramSnapshot(const void* snapshot) {
+void D3D12CommandProcessor::RestoreEdramSnapshot(const void* snapshot,
+                                                 size_t size_bytes) {
   // Starting a new frame because descriptors may be needed.
   if (!BeginSubmission(true)) {
     return;
   }
-  render_target_cache_->RestoreEdramSnapshot(snapshot);
+  render_target_cache_->RestoreEdramSnapshot(snapshot, size_bytes);
 }
 
 void D3D12CommandProcessor::PollCompletedSubmission() {
@@ -868,15 +871,10 @@ bool D3D12CommandProcessor::SetupContext() {
     return false;
   }
 
-  // ROV always uses Xenos' MSAA sample positions.
-  // xenos_sample_positions targets host RTs with programmable position support.
-  xenos_sample_positions_used_ =
+  xenos_sample_positions_supported_ =
       command_list_1_ != nullptr &&
       provider.GetProgrammableSamplePositionsTier() !=
-          D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_NOT_SUPPORTED &&
-      (render_target_cache_->GetPath() ==
-           RenderTargetCache::Path::kPixelShaderInterlock ||
-       cvars::xenos_sample_positions);
+          D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_NOT_SUPPORTED;
 
   // Hybrid RTV queries count pre-test coverage in the pixel shader and clear
   // their counter slot with WriteBufferImmediate, so they need CommandList2.
@@ -2817,6 +2815,16 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   }
 
   if (cvars::async_shader_compilation) {
+    // A skipped draw to a small target or with memexport may never be redone,
+    // so wait for the pipeline.
+    if (pipeline_cache_->IsPipelineCreationPendingByHandle(pipeline_handle) &&
+        (memexport_used || draw_util::IsAsyncPipelineWaitNeededForDraw(regs))) {
+      do {
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+      } while (
+          pipeline_cache_->IsPipelineCreationPendingByHandle(pipeline_handle));
+    }
+
     if (zpd_hybrid &&
         pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) == nullptr) {
       zpd_hybrid = false;
@@ -2892,7 +2900,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
       host_render_targets_used &&
           render_target_cache_->depth_float24_convert_in_pixel_shader(),
       host_render_targets_used, pixel_shader && pixel_shader->writes_depth(),
-      !host_render_targets_used || xenos_sample_positions_used_);
+      !host_render_targets_used || xenos_sample_positions_used());
   gviargs.SetupRegisterValues(regs, window_offset_tiles != 0);
 
   if (gviargs == previous_viewport_info_args_) {
@@ -3039,6 +3047,38 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
           "shared memory",
           memexport_range.base_address_dwords << 2, memexport_range.size_bytes);
       return false;
+    }
+  }
+  // Snapshot the export ranges before the draw so the readback after it only
+  // copies the bytes the shaders actually changed. Copying the whole range
+  // back would overwrite anything the CPU wrote there while the draw was in
+  // flight, since the ranges are usually much larger than what gets exported.
+  // The first half of the readback buffer holds the snapshot, the second half
+  // the result.
+  uint32_t memexport_total_size = 0;
+  bool memexport_snapshot_taken = false;
+  if (memexport_used && GetGPUSetting(GPUSetting::ReadbackMemexport)) {
+    for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+      memexport_total_size += memexport_range.size_bytes;
+    }
+    if (memexport_total_size != 0) {
+      ID3D12Resource* readback_buffer =
+          RequestReadbackBuffer(memexport_total_size * 2);
+      if (readback_buffer != nullptr) {
+        shared_memory_->UseAsCopySource();
+        SubmitBarriers();
+        ID3D12Resource* shared_memory_buffer = shared_memory_->GetBuffer();
+        uint32_t readback_buffer_offset = 0;
+        for (const draw_util::MemExportRange& memexport_range :
+             memexport_ranges_) {
+          deferred_command_list_.D3DCopyBufferRegion(
+              readback_buffer, readback_buffer_offset, shared_memory_buffer,
+              memexport_range.base_address_dwords << 2,
+              memexport_range.size_bytes);
+          readback_buffer_offset += memexport_range.size_bytes;
+        }
+        memexport_snapshot_taken = true;
+      }
     }
   }
   // Primitive topology.
@@ -3232,48 +3272,49 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
       shared_memory_->RangeWrittenByGpu(
           memexport_range.base_address_dwords << 2, memexport_range.size_bytes);
     }
-    if (GetGPUSetting(GPUSetting::ReadbackMemexport)) {
+    if (memexport_snapshot_taken) {
       // Read the exported data on the CPU.
-      uint32_t memexport_total_size = 0;
-      for (const draw_util::MemExportRange& memexport_range :
-           memexport_ranges_) {
-        memexport_total_size += memexport_range.size_bytes;
-      }
-      if (memexport_total_size != 0) {
-        ID3D12Resource* readback_buffer =
-            RequestReadbackBuffer(memexport_total_size);
-        if (readback_buffer != nullptr) {
-          shared_memory_->UseAsCopySource();
-          SubmitBarriers();
-          ID3D12Resource* shared_memory_buffer = shared_memory_->GetBuffer();
-          uint32_t readback_buffer_offset = 0;
-          for (const draw_util::MemExportRange& memexport_range :
-               memexport_ranges_) {
-            uint32_t memexport_range_size = memexport_range.size_bytes;
-            deferred_command_list_.D3DCopyBufferRegion(
-                readback_buffer, readback_buffer_offset, shared_memory_buffer,
-                memexport_range.base_address_dwords << 2, memexport_range_size);
-            readback_buffer_offset += memexport_range_size;
-          }
-          if (AwaitAllQueueOperationsCompletion()) {
-            D3D12_RANGE readback_range;
-            readback_range.Begin = 0;
-            readback_range.End = memexport_total_size;
-            void* readback_mapping;
-            if (SUCCEEDED(readback_buffer->Map(0, &readback_range,
-                                               &readback_mapping))) {
-              const uint8_t* readback_bytes =
-                  reinterpret_cast<const uint8_t*>(readback_mapping);
-              for (const draw_util::MemExportRange& memexport_range :
-                   memexport_ranges_) {
-                std::memcpy(memory_->TranslatePhysical(
-                                memexport_range.base_address_dwords << 2),
-                            readback_bytes, memexport_range.size_bytes);
-                readback_bytes += memexport_range.size_bytes;
+      ID3D12Resource* readback_buffer =
+          RequestReadbackBuffer(memexport_total_size * 2);
+      if (readback_buffer != nullptr) {
+        shared_memory_->UseAsCopySource();
+        SubmitBarriers();
+        ID3D12Resource* shared_memory_buffer = shared_memory_->GetBuffer();
+        uint32_t readback_buffer_offset = memexport_total_size;
+        for (const draw_util::MemExportRange& memexport_range :
+             memexport_ranges_) {
+          uint32_t memexport_range_size = memexport_range.size_bytes;
+          deferred_command_list_.D3DCopyBufferRegion(
+              readback_buffer, readback_buffer_offset, shared_memory_buffer,
+              memexport_range.base_address_dwords << 2, memexport_range_size);
+          readback_buffer_offset += memexport_range_size;
+        }
+        if (AwaitAllQueueOperationsCompletion()) {
+          D3D12_RANGE readback_range;
+          readback_range.Begin = 0;
+          readback_range.End = memexport_total_size * 2;
+          void* readback_mapping;
+          if (SUCCEEDED(readback_buffer->Map(0, &readback_range,
+                                             &readback_mapping))) {
+            // Compared per byte as exports of 8 and 16 bit formats give
+            // ranges that aren't a multiple of 4 bytes.
+            const uint8_t* before_bytes =
+                reinterpret_cast<const uint8_t*>(readback_mapping);
+            const uint8_t* after_bytes = before_bytes + memexport_total_size;
+            for (const draw_util::MemExportRange& memexport_range :
+                 memexport_ranges_) {
+              uint8_t* guest_bytes = memory_->TranslatePhysical(
+                  memexport_range.base_address_dwords << 2);
+              for (uint32_t i = 0; i < memexport_range.size_bytes; ++i) {
+                if (after_bytes[i] != before_bytes[i]) {
+                  guest_bytes[i] = after_bytes[i];
+                }
               }
-              D3D12_RANGE readback_write_range = {};
-              readback_buffer->Unmap(0, &readback_write_range);
+              before_bytes += memexport_range.size_bytes;
+              after_bytes += memexport_range.size_bytes;
             }
+            D3D12_RANGE readback_write_range = {};
+            readback_buffer->Unmap(0, &readback_write_range);
           }
         }
       }
@@ -4038,7 +4079,7 @@ void D3D12CommandProcessor::ClearCommandAllocatorCache() {
 
 void D3D12CommandProcessor::UpdateSamplePositions(
     xenos::MsaaSamples msaa_samples) {
-  if (!xenos_sample_positions_used_ ||
+  if (!xenos_sample_positions_used() ||
       current_sample_positions_ == msaa_samples) {
     return;
   }
@@ -4243,7 +4284,8 @@ XE_NOINLINE void D3D12CommandProcessor::UpdateSystemConstantValues_Impl(
                                normalized_depth_control.z_enable;
   if (edram_rov_used && depth_stencil_enabled) {
     for (uint32_t i = 0; i < 4; ++i) {
-      if (rb_depth_info.depth_base == color_infos[i].color_base &&
+      if (render_target_cache_->WrapEdramBase(rb_depth_info.depth_base) ==
+              render_target_cache_->WrapEdramBase(color_infos[i].color_base) &&
           RenderTargetCache::ColorOverlapsDepthStencil(
               color_infos[i].color_format, rt_keep_masks[i][0],
               rt_keep_masks[i][1], normalized_depth_control)) {
@@ -4581,19 +4623,20 @@ XE_NOINLINE void D3D12CommandProcessor::UpdateSystemConstantValues_Impl(
     reg::RB_COLOR_INFO color_info = color_infos[i];
     // Exponent bias is in bits 20:25 of RB_COLOR_INFO.
     int32_t color_exp_bias = color_info.color_exp_bias;
+    auto color_exp_bias_scale = xe::memory::Reinterpret<float>(
+        int32_t(0x3F800000 + (color_exp_bias << 23)));
     if (color_info.color_format == xenos::ColorRenderTargetFormat::k_16_16 ||
         color_info.color_format ==
             xenos::ColorRenderTargetFormat::k_16_16_16_16) {
       if (render_target_cache_->GetPath() ==
               RenderTargetCache::Path::kHostRenderTargets &&
           !render_target_cache_->IsFixed16TruncatedToMinus1To1()) {
-        // Remap from -32...32 to -1...1 by dividing the output values by 32,
-        // losing blending correctness, but getting the full range.
-        color_exp_bias -= 5;
+        // Remap to -1...1 by scaling the output values by 1024/32767, losing
+        // blending correctness, but getting the full range apart from -32,
+        // which SNORM folds into -32767/1024.
+        color_exp_bias_scale *= 1024.0f / 32767.0f;
       }
     }
-    auto color_exp_bias_scale = xe::memory::Reinterpret<float>(
-        int32_t(0x3F800000 + (color_exp_bias << 23)));
 
     update_dirty_floatmask(system_constants_.color_exp_bias[i],
                            color_exp_bias_scale);
@@ -4614,8 +4657,8 @@ XE_NOINLINE void D3D12CommandProcessor::UpdateSystemConstantValues_Impl(
         uint32_t rt_base_dwords_scaled =
             draw_util::AddWindowOffsetToEdramBase(
                 color_info.color_base, window_offset_tiles,
-                xenos::IsColorRenderTargetFormat64bpp(
-                    color_info.color_format)) *
+                xenos::IsColorRenderTargetFormat64bpp(color_info.color_format),
+                render_target_cache_->edram_tile_count()) *
             edram_tile_dwords_scaled;
         update_dirty_uint32_cmp(
             system_constants_.edram_rt_base_dwords_scaled[i],
@@ -4703,8 +4746,9 @@ XE_NOINLINE void D3D12CommandProcessor::UpdateSystemConstantValues_Impl(
 
   if constexpr (edram_rov_used) {
     uint32_t depth_base_dwords_scaled =
-        draw_util::AddWindowOffsetToEdramBase(rb_depth_info.depth_base,
-                                              window_offset_tiles, false) *
+        draw_util::AddWindowOffsetToEdramBase(
+            rb_depth_info.depth_base, window_offset_tiles, false,
+            render_target_cache_->edram_tile_count()) *
         edram_tile_dwords_scaled;
     update_dirty_uint32_cmp(system_constants_.edram_depth_base_dwords_scaled,
                             depth_base_dwords_scaled);

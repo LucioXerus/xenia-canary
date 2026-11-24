@@ -9,8 +9,10 @@
 
 #include "xenia/gpu/vulkan/vulkan_command_processor.h"
 
+#include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <thread>
 
 #include "xenia/apu/audio_system.h"
 #include "xenia/base/assert.h"
@@ -128,7 +130,8 @@ void VulkanCommandProcessor::InitializeShaderStorage(
                                            std::move(completion_callback));
 }
 
-void VulkanCommandProcessor::RestoreEdramSnapshot(const void* snapshot) {}
+void VulkanCommandProcessor::RestoreEdramSnapshot(const void* snapshot,
+                                                  size_t size_bytes) {}
 
 std::string VulkanCommandProcessor::GetWindowTitleText() const {
   std::ostringstream title;
@@ -2715,6 +2718,17 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
       return false;
     }
   }
+
+  // A placeholder draw to a small target, or in place of a pixel shader with
+  // memexport, may never be redone, so wait for the real pipeline.
+  if (pipeline->is_placeholder.load(std::memory_order_acquire) &&
+      ((pixel_shader && pixel_shader->memexport_eM_written() != 0) ||
+       draw_util::IsAsyncPipelineWaitNeededForDraw(regs))) {
+    do {
+      std::this_thread::sleep_for(std::chrono::microseconds(100));
+    } while (pipeline->is_placeholder.load(std::memory_order_acquire));
+  }
+
   // If async mode is active, this may be a placeholder pipeline. The real
   // pipeline will be swapped in by the creation thread when ready.
   // We re-load the handle to pick up any swap that may have happened.
@@ -2989,6 +3003,41 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
                  memexport_range_base_bytes + memexport_range.size_bytes);
   }
 
+  // Snapshot the export ranges before the draw so the readback after it only
+  // copies the bytes the shaders actually changed. Copying the whole range
+  // back would overwrite anything the CPU wrote there while the draw was in
+  // flight, since the ranges are usually much larger than what gets exported.
+  // The first half of the readback buffer holds the snapshot, the second half
+  // the result.
+  uint32_t memexport_total_size = 0;
+  bool memexport_snapshot_taken = false;
+  if (GetGPUSetting(GPUSetting::ReadbackMemexport)) {
+    for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+      memexport_total_size += memexport_range.size_bytes;
+    }
+    if (memexport_total_size != 0) {
+      VkBuffer readback_buffer =
+          RequestReadbackBuffer(memexport_total_size * 2);
+      if (readback_buffer != VK_NULL_HANDLE) {
+        shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
+        SubmitBarriers(true);
+        VkBuffer shared_memory_buffer = shared_memory_->buffer();
+        uint32_t readback_buffer_offset = 0;
+        for (const draw_util::MemExportRange& memexport_range :
+             memexport_ranges_) {
+          VkBufferCopy copy_region = {};
+          copy_region.srcOffset = memexport_range.base_address_dwords << 2;
+          copy_region.dstOffset = readback_buffer_offset;
+          copy_region.size = memexport_range.size_bytes;
+          deferred_command_buffer_.CmdVkCopyBuffer(
+              shared_memory_buffer, readback_buffer, 1, &copy_region);
+          readback_buffer_offset += memexport_range.size_bytes;
+        }
+        memexport_snapshot_taken = true;
+      }
+    }
+  }
+
   // Insert the shared memory barrier if needed.
   // TODO(Triang3l): Find some PM4 command that can be used for indication of
   // when memexports should be awaited instead of inserting the barrier in Use
@@ -3083,75 +3132,75 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   }
 
   // CPU readback for memexport data (if enabled).
-  if (GetGPUSetting(GPUSetting::ReadbackMemexport) &&
-      !memexport_ranges_.empty()) {
-    // Calculate total size of all memexport ranges.
-    uint32_t memexport_total_size = 0;
-    for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
-      memexport_total_size += memexport_range.size_bytes;
-    }
+  if (memexport_snapshot_taken) {
+    VkBuffer readback_buffer = RequestReadbackBuffer(memexport_total_size * 2);
+    if (readback_buffer != VK_NULL_HANDLE) {
+      const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+      const ui::vulkan::VulkanDevice::Functions& dfn =
+          vulkan_device->functions();
+      const VkDevice device = vulkan_device->device();
 
-    if (memexport_total_size > 0) {
-      VkBuffer readback_buffer = RequestReadbackBuffer(memexport_total_size);
-      if (readback_buffer != VK_NULL_HANDLE) {
-        const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
-        const ui::vulkan::VulkanDevice::Functions& dfn =
-            vulkan_device->functions();
-        const VkDevice device = vulkan_device->device();
+      VkBuffer shared_memory_buffer = shared_memory_->buffer();
 
-        VkBuffer shared_memory_buffer = shared_memory_->buffer();
+      // Ensure shared memory is ready for transfer, outside the render pass.
+      shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
+      SubmitBarriers(true);
 
-        // Ensure shared memory is ready for transfer.
-        shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
+      // Copy each memexport range to the second half of the readback buffer.
+      uint32_t readback_buffer_offset = memexport_total_size;
+      for (const draw_util::MemExportRange& memexport_range :
+           memexport_ranges_) {
+        VkBufferCopy copy_region = {};
+        copy_region.srcOffset = memexport_range.base_address_dwords << 2;
+        copy_region.dstOffset = readback_buffer_offset;
+        copy_region.size = memexport_range.size_bytes;
 
-        // Copy each memexport range to the readback buffer.
-        uint32_t readback_buffer_offset = 0;
-        for (const draw_util::MemExportRange& memexport_range :
-             memexport_ranges_) {
-          VkBufferCopy copy_region = {};
-          copy_region.srcOffset = memexport_range.base_address_dwords << 2;
-          copy_region.dstOffset = readback_buffer_offset;
-          copy_region.size = memexport_range.size_bytes;
+        deferred_command_buffer_.CmdVkCopyBuffer(
+            shared_memory_buffer, readback_buffer, 1, &copy_region);
 
-          deferred_command_buffer_.CmdVkCopyBuffer(
-              shared_memory_buffer, readback_buffer, 1, &copy_region);
+        readback_buffer_offset += memexport_range.size_bytes;
+      }
 
-          readback_buffer_offset += memexport_range.size_bytes;
-        }
-
-        // Wait for GPU to finish (SYNCHRONIZATION STALL)
-        if (AwaitAllQueueOperationsCompletion()) {
-          // Map staging buffer and copy to guest memory.
-          void* mapped_data;
-          if (dfn.vkMapMemory(device, memexport_readback_buffer_memory_, 0,
-                              memexport_total_size, 0,
-                              &mapped_data) == VK_SUCCESS) {
-            if (mapped_data) {
-              const uint8_t* readback_bytes =
-                  static_cast<const uint8_t*>(mapped_data);
-              for (const draw_util::MemExportRange& memexport_range :
-                   memexport_ranges_) {
-                std::memcpy(memory_->TranslatePhysical(
-                                memexport_range.base_address_dwords << 2),
-                            readback_bytes, memexport_range.size_bytes);
-                readback_bytes += memexport_range.size_bytes;
+      // Wait for GPU to finish (SYNCHRONIZATION STALL)
+      if (AwaitAllQueueOperationsCompletion()) {
+        // Map staging buffer and copy to guest memory.
+        void* mapped_data;
+        if (dfn.vkMapMemory(device, memexport_readback_buffer_memory_, 0,
+                            VkDeviceSize(memexport_total_size) * 2, 0,
+                            &mapped_data) == VK_SUCCESS) {
+          if (mapped_data) {
+            // Compared per byte as exports of 8 and 16 bit formats give
+            // ranges that aren't a multiple of 4 bytes.
+            const uint8_t* before_bytes =
+                static_cast<const uint8_t*>(mapped_data);
+            const uint8_t* after_bytes = before_bytes + memexport_total_size;
+            for (const draw_util::MemExportRange& memexport_range :
+                 memexport_ranges_) {
+              uint8_t* guest_bytes = memory_->TranslatePhysical(
+                  memexport_range.base_address_dwords << 2);
+              for (uint32_t i = 0; i < memexport_range.size_bytes; ++i) {
+                if (after_bytes[i] != before_bytes[i]) {
+                  guest_bytes[i] = after_bytes[i];
+                }
               }
-            } else {
-              XELOGE(
-                  "VulkanCommandProcessor: Failed to map readback buffer "
-                  "(mapped_data is null)");
+              before_bytes += memexport_range.size_bytes;
+              after_bytes += memexport_range.size_bytes;
             }
-            dfn.vkUnmapMemory(device, memexport_readback_buffer_memory_);
           } else {
             XELOGE(
-                "VulkanCommandProcessor: Failed to map readback buffer memory "
-                "for memexport");
+                "VulkanCommandProcessor: Failed to map readback buffer "
+                "(mapped_data is null)");
           }
+          dfn.vkUnmapMemory(device, memexport_readback_buffer_memory_);
         } else {
           XELOGE(
-              "VulkanCommandProcessor: Failed to complete queue operations for "
-              "memexport readback");
+              "VulkanCommandProcessor: Failed to map readback buffer memory "
+              "for memexport");
         }
+      } else {
+        XELOGE(
+            "VulkanCommandProcessor: Failed to complete queue operations for "
+            "memexport readback");
       }
     }
   }
@@ -3569,6 +3618,7 @@ bool VulkanCommandProcessor::IssueCopy() {
                                                &downscale_copy_region);
     } else {
       shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
+      SubmitBarriers(true);
 
       VkBufferCopy copy_region = {};
       copy_region.srcOffset = written_address;
@@ -5117,7 +5167,8 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
                                normalized_depth_control.z_enable;
   if (edram_fragment_shader_interlock && depth_stencil_enabled) {
     for (uint32_t i = 0; i < 4; ++i) {
-      if (rb_depth_info.depth_base == color_infos[i].color_base &&
+      if (render_target_cache_->WrapEdramBase(rb_depth_info.depth_base) ==
+              render_target_cache_->WrapEdramBase(color_infos[i].color_base) &&
           RenderTargetCache::ColorOverlapsDepthStencil(
               color_infos[i].color_format, rt_keep_masks[i][0],
               rt_keep_masks[i][1], normalized_depth_control)) {
@@ -5444,6 +5495,9 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
     reg::RB_COLOR_INFO color_info = color_infos[i];
     // Exponent bias is in bits 20:25 of RB_COLOR_INFO.
     int32_t color_exp_bias = color_info.color_exp_bias;
+    float color_exp_bias_scale;
+    *reinterpret_cast<int32_t*>(&color_exp_bias_scale) =
+        UINT32_C(0x3F800000) + (color_exp_bias << 23);
     if (render_target_cache_->GetPath() ==
             RenderTargetCache::Path::kHostRenderTargets &&
         (color_info.color_format == xenos::ColorRenderTargetFormat::k_16_16 &&
@@ -5451,13 +5505,11 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
          color_info.color_format ==
                  xenos::ColorRenderTargetFormat::k_16_16_16_16 &&
              !render_target_cache_->IsFixedRGBA16TruncatedToMinus1To1())) {
-      // Remap from -32...32 to -1...1 by dividing the output values by 32,
-      // losing blending correctness, but getting the full range.
-      color_exp_bias -= 5;
+      // Remap to -1...1 by scaling the output values by 1024/32767, losing
+      // blending correctness, but getting the full range apart from -32,
+      // which SNORM folds into -32767/1024.
+      color_exp_bias_scale *= 1024.0f / 32767.0f;
     }
-    float color_exp_bias_scale;
-    *reinterpret_cast<int32_t*>(&color_exp_bias_scale) =
-        UINT32_C(0x3F800000) + (color_exp_bias << 23);
     dirty |= system_constants_.color_exp_bias[i] != color_exp_bias_scale;
     system_constants_.color_exp_bias[i] = color_exp_bias_scale;
     if (edram_fragment_shader_interlock) {
@@ -5472,8 +5524,8 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
         uint32_t rt_base_dwords_scaled =
             draw_util::AddWindowOffsetToEdramBase(
                 color_info.color_base, window_offset_tiles,
-                xenos::IsColorRenderTargetFormat64bpp(
-                    color_info.color_format)) *
+                xenos::IsColorRenderTargetFormat64bpp(color_info.color_format),
+                render_target_cache_->edram_tile_count()) *
             edram_tile_dwords_scaled;
         dirty |= system_constants_.edram_rt_base_dwords_scaled[i] !=
                  rt_base_dwords_scaled;
@@ -5524,8 +5576,9 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
 
   if (edram_fragment_shader_interlock) {
     uint32_t depth_base_dwords_scaled =
-        draw_util::AddWindowOffsetToEdramBase(rb_depth_info.depth_base,
-                                              window_offset_tiles, false) *
+        draw_util::AddWindowOffsetToEdramBase(
+            rb_depth_info.depth_base, window_offset_tiles, false,
+            render_target_cache_->edram_tile_count()) *
         edram_tile_dwords_scaled;
     dirty |= system_constants_.edram_depth_base_dwords_scaled !=
              depth_base_dwords_scaled;

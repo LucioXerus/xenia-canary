@@ -137,11 +137,17 @@ Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
     normalized_path = resolved_path;
   }
 
-  // Find the device.
-  auto it = std::ranges::find_if(std::as_const(devices_), [&](const auto& d) {
-    return xe::utf8::starts_with(normalized_path, d->mount_path());
-  });
-  if (it == devices_.cend()) {
+  // Find the device. The longest mount path wins, so a device mounted inside
+  // another device's tree (e.g. under the \Device\Harddisk0 NullDevice) is
+  // reachable regardless of registration order.
+  Device* device = nullptr;
+  for (const auto& d : devices_) {
+    if (xe::utf8::starts_with(normalized_path, d->mount_path()) &&
+        (!device || d->mount_path().size() > device->mount_path().size())) {
+      device = d.get();
+    }
+  }
+  if (!device) {
     // Supress logging the error for ShaderDumpxe:\CompareBackEnds as this is
     // not an actual problem nor something we care about.
     if (path != "ShaderDumpxe:\\CompareBackEnds") {
@@ -150,7 +156,6 @@ Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
     return nullptr;
   }
 
-  const auto& device = *it;
   auto relative_path = normalized_path.substr(device->mount_path().size());
   return device->ResolvePath(relative_path);
 }
@@ -194,6 +199,15 @@ bool VirtualFileSystem::DeletePath(const std::string_view path) {
     // Can't delete root.
     return false;
   }
+
+  auto global_lock = xe::global_critical_region::AcquireDirect();
+
+  // As on NT, delete when the last handle closes.
+  if (entry->open_file_count()) {
+    entry->SetForDeletion(true);
+    return true;
+  }
+
   return parent->Delete(entry);
 }
 
@@ -226,13 +240,17 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry,
   if (!base_path.empty()) {
     parent_entry = !root_entry ? ResolvePath(base_path)
                                : root_entry->ResolvePath(base_path);
-    if (!parent_entry) {
-      *out_action = FileAction::kDoesNotExist;
-      return X_STATUS_OBJECT_PATH_NOT_FOUND;
+    if (parent_entry) {
+      auto file_name = xe::utf8::find_name_from_guest_path(path);
+      entry = parent_entry->GetChild(file_name);
+    } else {
+      // The path can be a device's mount path, whose parent no device holds.
+      entry = !root_entry ? ResolvePath(path) : nullptr;
+      if (!entry) {
+        *out_action = FileAction::kDoesNotExist;
+        return X_STATUS_OBJECT_PATH_NOT_FOUND;
+      }
     }
-
-    auto file_name = xe::utf8::find_name_from_guest_path(path);
-    entry = parent_entry->GetChild(file_name);
   } else {
     entry = !root_entry ? ResolvePath(path) : root_entry->GetChild(path);
   }
@@ -332,9 +350,15 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry,
     }
   }
   if (!entry) {
-    // Create if needed (either new or as a replacement).
-    entry = CreatePath(
-        path, !is_directory ? kFileAttributeNormal : kFileAttributeDirectory);
+    // Create if needed (either new or as a replacement). Create under the
+    // parent resolved above, as re-walking the path from its first component
+    // fails for raw device paths like \Device\Harddisk0\Partition1\...
+    const uint32_t attributes =
+        !is_directory ? kFileAttributeNormal : kFileAttributeDirectory;
+    entry = parent_entry
+                ? parent_entry->CreateEntry(
+                      xe::utf8::find_name_from_guest_path(path), attributes)
+                : CreatePath(path, attributes);
     if (!entry) {
       return X_STATUS_ACCESS_DENIED;
     }
@@ -408,8 +432,19 @@ X_STATUS VirtualFileSystem::ExtractDeviceFile(Entry* entry,
 
     while (remaining_size > 0) {
       size_t bytes_read = 0;
-      in_file->ReadSync(std::span<uint8_t>(buffer, write_buffer_size), offset,
-                        &bytes_read);
+      result = in_file->ReadSync(
+          std::span<uint8_t>(buffer,
+                             std::min(write_buffer_size, remaining_size)),
+          offset, &bytes_read);
+
+      if (result != X_STATUS_SUCCESS || !bytes_read) {
+        XELOGE("Failed to read {} at offset {}", entry->path(), offset);
+        if (result == X_STATUS_SUCCESS) {
+          result = X_STATUS_UNSUCCESSFUL;
+        }
+        break;
+      }
+
       fwrite(buffer, bytes_read, 1, file);
       offset += bytes_read;
       remaining_size -= bytes_read;
@@ -423,7 +458,7 @@ X_STATUS VirtualFileSystem::ExtractDeviceFile(Entry* entry,
   if (buffer) {
     delete[] buffer;
   }
-  return 0;
+  return result;
 }
 
 X_STATUS VirtualFileSystem::ExtractDeviceFiles(Device* device,
@@ -441,7 +476,11 @@ X_STATUS VirtualFileSystem::ExtractDeviceFiles(Device* device,
       queue.push(entry.get());
     }
 
-    ExtractDeviceFile(entry, base_path, progress);
+    const X_STATUS result = ExtractDeviceFile(entry, base_path, progress);
+
+    if (result != X_STATUS_SUCCESS) {
+      return result;
+    }
   }
   return X_STATUS_SUCCESS;
 }

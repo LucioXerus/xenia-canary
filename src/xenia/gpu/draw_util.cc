@@ -922,10 +922,28 @@ void GetScissor(const RegisterFile& XE_RESTRICT regs,
   }
 }
 
+bool IsAsyncPipelineWaitNeededForDraw(const RegisterFile& XE_RESTRICT regs) {
+  auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+  uint32_t pitch_pixels = rb_surface_info.surface_pitch;
+
+  if (!pitch_pixels) {
+    return false;
+  }
+
+  uint32_t msaa_samples_x_log2 =
+      uint32_t(rb_surface_info.msaa_samples >= xenos::MsaaSamples::k4X);
+  uint32_t pitch_tiles_at_32bpp = ((pitch_pixels << msaa_samples_x_log2) +
+                                   (xenos::kEdramTileWidthSamples - 1)) /
+                                  xenos::kEdramTileWidthSamples;
+
+  return pitch_tiles_at_32bpp <= kAsyncPipelineWaitMaxPitchTiles;
+}
+
 int32_t GetWindowOffsetTiles(const RegisterFile& XE_RESTRICT regs,
                              reg::RB_DEPTHCONTROL normalized_depth_control,
                              uint32_t normalized_color_mask,
                              bool host_render_targets_used,
+                             uint32_t edram_tile_count,
                              bool& kept_in_viewport_out) {
   kept_in_viewport_out = false;
   if (!cvars::window_offset_in_edram) {
@@ -1001,22 +1019,22 @@ int32_t GetWindowOffsetTiles(const RegisterFile& XE_RESTRICT regs,
         uint32_t((scissor_bottom + tile_height_pixels - 1) /
                  tile_height_pixels) *
         pitch_tiles_at_32bpp;
-    if (rows_end_tiles_at_32bpp > xenos::kEdramTileCount) {
+    if (rows_end_tiles_at_32bpp > edram_tile_count) {
       return 0;
     }
 
     // Keep the offset in the viewport when 64bpp rows cross into the next
     // period, the draw is bound to the period its scissor top is in.
     uint32_t rows_end_tiles_at_64bpp = rows_end_tiles_at_32bpp * 2;
-    if (rows_end_tiles_at_64bpp > xenos::kEdramTileCount) {
+    if (rows_end_tiles_at_64bpp > edram_tile_count) {
       int32_t scissor_top =
           std::max(int32_t(regs.Get<reg::PA_SC_WINDOW_SCISSOR_TL>().tl_y),
                    int32_t(regs.Get<reg::PA_SC_SCREEN_SCISSOR_TL>().tl_y) -
                        window_y_offset);
       uint32_t rows_start_tiles_at_64bpp =
           uint32_t(scissor_top / tile_height_pixels) * pitch_tiles_at_32bpp * 2;
-      if (rows_end_tiles_at_64bpp > xenos::kEdramTileCount * 2 ||
-          rows_start_tiles_at_64bpp < xenos::kEdramTileCount) {
+      if (rows_end_tiles_at_64bpp > edram_tile_count * 2 ||
+          rows_start_tiles_at_64bpp < edram_tile_count) {
         for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
           if (!(normalized_color_mask & (uint32_t(0b1111) << (4 * i)))) {
             continue;
@@ -1110,21 +1128,6 @@ void AddMemExportRanges(const RegisterFile& regs, const Shader& shader,
       // Translated shaders shouldn't be performing exports with an unknown
       // format, the draw can still be performed.
       continue;
-    }
-    // TODO(Triang3l): Remove the unresearched format logging when it's known
-    // how exactly these formats need to be handled (most importantly what
-    // components need to be stored and in which order).
-    switch (stream.format) {
-      case xenos::ColorFormat::k_8_A:
-      case xenos::ColorFormat::k_8_B:
-      case xenos::ColorFormat::k_8_8_8_8_A:
-        XELOGW(
-            "Memexport done to an unresearched format {}, report the game to "
-            "Xenia developers!",
-            FormatInfo::GetName(format_info.format));
-        break;
-      default:
-        break;
     }
     uint32_t stream_size_bytes =
         stream.index_count * (format_info.bits_per_pixel >> 3);
@@ -1239,7 +1242,7 @@ constexpr ResolveCopyShaderInfo
 XE_MSVC_OPTIMIZE_SMALL()
 bool GetResolveInfo(const RegisterFile& regs, const Memory& memory,
                     TraceWriter& trace_writer, uint32_t draw_resolution_scale_x,
-                    uint32_t draw_resolution_scale_y,
+                    uint32_t draw_resolution_scale_y, uint32_t edram_tile_count,
                     bool fixed_rg16_truncated_to_minus_1_to_1,
                     bool fixed_rgba16_truncated_to_minus_1_to_1,
                     ResolveInfo& info_out) {
@@ -1394,6 +1397,8 @@ bool GetResolveInfo(const RegisterFile& regs, const Memory& memory,
   assert_true(draw_resolution_scale_y <= 7);
   info_out.coordinate_info.draw_resolution_scale_x = draw_resolution_scale_x;
   info_out.coordinate_info.draw_resolution_scale_y = draw_resolution_scale_y;
+  info_out.coordinate_info.edram_tile_count_log2 =
+      xe::log2_floor(edram_tile_count);
 
   // Handle the destination.
   bool is_depth =
@@ -1423,25 +1428,16 @@ bool GetResolveInfo(const RegisterFile& regs, const Memory& memory,
     dest_format = DepthRenderTargetToTextureFormat(rb_depth_info.depth_format);
   } else {
     dest_format = xenos::TextureFormat(rb_copy_dest_info.copy_dest_format);
-    // For development feedback - not much known about these formats currently.
-    xenos::TextureFormat dest_closest_format;
     switch (dest_format) {
       case xenos::TextureFormat::k_8_A:
       case xenos::TextureFormat::k_8_B:
-        dest_closest_format = xenos::TextureFormat::k_8;
+        dest_format = xenos::TextureFormat::k_8;
         break;
       case xenos::TextureFormat::k_8_8_8_8_A:
-        dest_closest_format = xenos::TextureFormat::k_8_8_8_8;
+        dest_format = xenos::TextureFormat::k_8_8_8_8;
         break;
       default:
-        dest_closest_format = dest_format;
-    }
-    if (dest_format != dest_closest_format) {
-      XELOGW(
-          "Resolving to format {}, which is untested - treating like {}. "
-          "Report the game to Xenia developers!",
-          FormatInfo::GetName(dest_format),
-          FormatInfo::GetName(dest_closest_format));
+        break;
     }
   }
 
@@ -1617,13 +1613,14 @@ bool GetResolveInfo(const RegisterFile& regs, const Memory& memory,
   uint32_t edram_base_offset_tiles =
       base_offset_y_tiles * surface_pitch_tiles + base_offset_x_tiles;
 
-  // Write the color/depth EDRAM info.
-  bool fill_half_pixel_offset =
+  info_out.coordinate_info.fill_half_pixel_offset =
       (draw_resolution_scale_x > 1 || draw_resolution_scale_y > 1) &&
       cvars::resolve_resolution_scale_fill_half_pixel_offset &&
       cvars::half_pixel_offset &&
       regs.Get<reg::PA_SU_VTX_CNTL>().pix_center ==
           xenos::PixelCenter::kD3DZero;
+
+  // Write the color/depth EDRAM info.
   int32_t exp_bias = is_depth ? 0 : rb_copy_dest_info.copy_dest_exp_bias;
   ResolveEdramInfo depth_edram_info;
   depth_edram_info.packed = 0;
@@ -1632,13 +1629,14 @@ bool GetResolveInfo(const RegisterFile& regs, const Memory& memory,
     depth_edram_info.msaa_samples = rb_surface_info.msaa_samples;
     depth_edram_info.is_depth = 1;
     // If wrapping happens, it's fine, it doesn't matter how many times and
-    // where modulo xenos::kEdramTileCount is applied in this context.
+    // where modulo the tile count is applied in this context.
+    info_out.depth_original_base =
+        rb_depth_info.depth_base & (edram_tile_count - 1);
     depth_edram_info.base_tiles =
-        rb_depth_info.depth_base + edram_base_offset_tiles;
+        (info_out.depth_original_base + edram_base_offset_tiles) &
+        (edram_tile_count - 1);
     depth_edram_info.format = uint32_t(rb_depth_info.depth_format);
     depth_edram_info.format_is_64bpp = 0;
-    depth_edram_info.fill_half_pixel_offset = uint32_t(fill_half_pixel_offset);
-    info_out.depth_original_base = rb_depth_info.depth_base;
   } else {
     info_out.depth_original_base = 0;
   }
@@ -1656,12 +1654,14 @@ bool GetResolveInfo(const RegisterFile& regs, const Memory& memory,
     color_edram_info.msaa_samples = rb_surface_info.msaa_samples;
     color_edram_info.is_depth = 0;
     // If wrapping happens, it's fine, it doesn't matter how many times and
-    // where modulo xenos::kEdramTileCount is applied in this context.
+    // where modulo the tile count is applied in this context.
+    info_out.color_original_base =
+        color_info.color_base & (edram_tile_count - 1);
     color_edram_info.base_tiles =
-        color_info.color_base + (edram_base_offset_tiles << is_64bpp);
+        (info_out.color_original_base + (edram_base_offset_tiles << is_64bpp)) &
+        (edram_tile_count - 1);
     color_edram_info.format = uint32_t(color_info.color_format);
     color_edram_info.format_is_64bpp = is_64bpp;
-    color_edram_info.fill_half_pixel_offset = uint32_t(fill_half_pixel_offset);
     color_edram_info.decode_pwl_gamma = 1;
     if ((fixed_rg16_truncated_to_minus_1_to_1 &&
          color_info.color_format == xenos::ColorRenderTargetFormat::k_16_16) ||
@@ -1674,7 +1674,6 @@ bool GetResolveInfo(const RegisterFile& regs, const Memory& memory,
       // to create a new copy info structure with one more bit just for this).
       exp_bias = std::min(exp_bias + int32_t(5), int32_t(31));
     }
-    info_out.color_original_base = color_info.color_base;
   } else {
     info_out.color_original_base = 0;
   }

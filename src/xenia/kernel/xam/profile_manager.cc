@@ -17,8 +17,8 @@
 #include "xenia/hid/input_system.h"
 #include "xenia/kernel/XLiveAPI.h"
 #include "xenia/kernel/kernel_state.h"
-#include "xenia/kernel/util/crypto_utils.h"
 #include "xenia/kernel/util/friends_util.h"
+#include "xenia/kernel/xboxkrnl/xboxkrnl_crypt.h"
 #include "xenia/vfs/devices/host_path_device.h"
 
 DEFINE_string(logged_profile_slot_0_xuid, "",
@@ -36,25 +36,26 @@ namespace xam {
 
 bool ProfileManager::DecryptAccountFile(const uint8_t* data,
                                         X_XAMACCOUNTINFO* output, bool devkit) {
-  const uint8_t* key = util::GetXeKey(0x19, devkit);
+  uint8_t* key = const_cast<uint8_t*>(xboxkrnl::XeKeysGetKeyData(0x19, devkit));
   if (!key) {
     return false;  // this shouldn't happen...
   }
 
   // Generate RC4 key from data hash
   uint8_t rc4_key[0x14];
-  util::HmacSha(key, 0x10, data, 0x10, 0, 0, 0, 0, rc4_key, 0x14);
+  xboxkrnl::XeCryptHmacSha_entry(key, 0x10, const_cast<uint8_t*>(data), 0x10,
+                                 nullptr, 0, nullptr, 0, rc4_key, 0x14);
 
   uint8_t dec_data[sizeof(X_XAMACCOUNTINFO) + 8];
 
   // Decrypt data
-  util::RC4(rc4_key, 0x10, data + 0x10, sizeof(dec_data), dec_data,
-            sizeof(dec_data));
+  std::memcpy(dec_data, data + 0x10, sizeof(dec_data));
+  xboxkrnl::XeCryptRc4_entry(rc4_key, 0x10, dec_data, sizeof(dec_data));
 
   // Verify decrypted data against hash
   uint8_t data_hash[0x14];
-  util::HmacSha(key, 0x10, dec_data, sizeof(dec_data), 0, 0, 0, 0, data_hash,
-                0x14);
+  xboxkrnl::XeCryptHmacSha_entry(key, 0x10, dec_data, sizeof(dec_data), nullptr,
+                                 0, nullptr, 0, data_hash, 0x14);
 
   if (std::memcmp(data, data_hash, 0x10) == 0) {
     // Copy account data to output
@@ -67,7 +68,7 @@ bool ProfileManager::DecryptAccountFile(const uint8_t* data,
 
 void ProfileManager::EncryptAccountFile(const X_XAMACCOUNTINFO* input,
                                         uint8_t* output, bool devkit) {
-  const uint8_t* key = util::GetXeKey(0x19, devkit);
+  uint8_t* key = const_cast<uint8_t*>(xboxkrnl::XeKeysGetKeyData(0x19, devkit));
   if (!key) {
     return;  // this shouldn't happen...
   }
@@ -84,18 +85,18 @@ void ProfileManager::EncryptAccountFile(const X_XAMACCOUNTINFO* input,
 
   // Set data hash
   uint8_t data_hash[0x14];
-  util::HmacSha(key, 0x10, output + 0x10, enc_data_size, 0, 0, 0, 0, data_hash,
-                0x14);
+  xboxkrnl::XeCryptHmacSha_entry(key, 0x10, output + 0x10, enc_data_size,
+                                 nullptr, 0, nullptr, 0, data_hash, 0x14);
 
   std::memcpy(output, data_hash, 0x10);
 
   // Generate RC4 key from data hash
   uint8_t rc4_key[0x14];
-  util::HmacSha(key, 0x10, data_hash, 0x10, 0, 0, 0, 0, rc4_key, 0x14);
+  xboxkrnl::XeCryptHmacSha_entry(key, 0x10, data_hash, 0x10, nullptr, 0,
+                                 nullptr, 0, rc4_key, 0x14);
 
   // Encrypt data
-  util::RC4(rc4_key, 0x10, output + 0x10, enc_data_size, output + 0x10,
-            enc_data_size);
+  xboxkrnl::XeCryptRc4_entry(rc4_key, 0x10, output + 0x10, enc_data_size);
 }
 
 ProfileManager::ProfileManager(KernelState* kernel_state,
@@ -252,6 +253,47 @@ bool ProfileManager::LoadAccount(const uint64_t xuid) {
 
   accounts_.insert_or_assign(xuid, tmp_acct);
   return true;
+}
+
+std::vector<uint8_t> ProfileManager::GetAccountIcon(const uint64_t xuid,
+                                                    const XTileType tile_type) {
+  if (const auto profile = GetProfile(xuid); profile) {
+    const auto icon = profile->GetProfileIcon(tile_type);
+    return {icon.begin(), icon.end()};
+  }
+
+  if (!accounts_.contains(xuid) || !kTileFileNames.contains(tile_type)) {
+    return {};
+  }
+
+  if (!MountProfile(xuid)) {
+    return {};
+  }
+
+  const std::string guest_path = fmt::format(kDefaultMountFormat, xuid) +
+                                 ":\\" + kTileFileNames.at(tile_type);
+
+  std::vector<uint8_t> icon_data;
+
+  xe::vfs::File* file = nullptr;
+  xe::vfs::FileAction action = {};
+  const X_STATUS status = kernel_state_->file_system()->OpenFile(
+      nullptr, guest_path, xe::vfs::FileDisposition::kOpen,
+      xe::vfs::FileAccess::kFileReadData, false, true, &file, &action);
+
+  if (XSUCCEEDED(status) && file && file->entry()) {
+    icon_data.resize(file->entry()->size());
+
+    size_t bytes_read = 0;
+    file->ReadSync(std::span<uint8_t>(icon_data.data(), icon_data.size()), 0,
+                   &bytes_read);
+    file->Destroy();
+
+    icon_data.resize(bytes_read);
+  }
+
+  DismountProfile(xuid);
+  return icon_data;
 }
 
 bool ProfileManager::MountProfile(const uint64_t xuid, std::string mount_path) {

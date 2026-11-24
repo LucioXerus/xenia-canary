@@ -10,6 +10,7 @@
 #ifndef XENIA_CPU_BACKEND_X64_X64_EMITTER_H_
 #define XENIA_CPU_BACKEND_X64_X64_EMITTER_H_
 
+#include <deque>
 #include <vector>
 
 #include "xenia/base/arena.h"
@@ -111,6 +112,7 @@ enum XmmConst {
   XMMUnpackFLOAT16_4,
   XMMPackSHORT_Min,
   XMMPackSHORT_Max,
+  XMMPackSHORT_NaN,
   XMMPackSHORT_2,
   XMMPackSHORT_4,
   XMMUnpackSHORT_2,
@@ -118,12 +120,14 @@ enum XmmConst {
   XMMUnpackSHORT_Overflow,
   XMMPackUINT_2101010_MinUnpacked,
   XMMPackUINT_2101010_MaxUnpacked,
+  XMMPackUINT_2101010_NaN,
   XMMPackUINT_2101010_MaskUnpacked,
   XMMPackUINT_2101010_MaskPacked,
   XMMPackUINT_2101010_Shift,
   XMMUnpackUINT_2101010_Overflow,
   XMMPackULONG_4202020_MinUnpacked,
   XMMPackULONG_4202020_MaxUnpacked,
+  XMMPackULONG_4202020_NaN,
   XMMPackULONG_4202020_MaskUnpacked,
   XMMPackULONG_4202020_PermuteXZ,
   XMMPackULONG_4202020_PermuteYW,
@@ -174,9 +178,37 @@ enum XmmConst {
   XMMLVRCmp16,
   XMMSTVLShuffle,
   XMMSTVRSwapMask,  // swapwordmask with bit 7 set
-  XMMVSRShlByteshuf,
-  XMMVSRMask,
-  XMMVRsqrteTableStart,
+  XMMQuietBit,      // 0x00400000
+  // Clears the bits of a double below single precision, so converting it to
+  // single rounds toward zero
+  XMMDoubleToSingleTruncateMask,
+  // For ARITHMETIC_SINGLE_RANGE, see EmitSingleRangeCheck
+  XMMSingleRangeBias,
+  XMMSingleRangeLimit,
+  // For vmsum3fp128 and vmsum4fp128, see EmitVectorMultiplySum
+  XMMVmsumInverseGridBase,
+  XMMVmsumGridSum,
+  XMMVmsum3Adjust,  // 4 entries, by the number of negative products
+  XMMVmsum4Adjust = XMMVmsum3Adjust + 4,  // 5 entries
+  // For the inline vrefp, see RECIP_V128
+  XMMVRefpStepMask = XMMVmsum4Adjust + 5,
+  XMMVRefpSlopeMask,
+  XMMVRefpMantissaMask,
+  XMMVRefpExponentBias,
+  XMMVRefpLargeLimit,
+  XMMVRefpSmallestNormal,
+  // For the inline vlogefp and vexptefp, see LOG2_V128 and POW2_V128
+  XMMEstimateIndexMask,
+  XMMEstimateExponentMask,
+  XMMVLogeExponentBias,
+  XMMVLogeScale,
+  XMMVLogeZeroResult,
+  XMMVExpteShiftBase,
+  XMMVExpteExponentBias,
+  XMMVExpteSmallestExponent,
+  XMMVExpteLargestInputExponent,
+  XMMVRefpTable,
+  XMMVRsqrteTableStart = XMMVRefpTable + (32 / 4),
   XMMVRsqrteTableBase =
       XMMVRsqrteTableStart +
       (32 /
@@ -273,6 +305,10 @@ class X64Emitter : public Xbyak::CodeGenerator {
   void UnimplementedInstr(const hir::Instr* i);
 
   void Call(const hir::Instr* instr, GuestFunction* function);
+  // Emits a PPC __savegprlr_N/__restgprlr_N helper body inline instead of
+  // calling it. Returns false when the callee is not a GPR saverest helper.
+  bool TryInlinePPCGprLrSaveRestore(const hir::Instr* instr,
+                                    const GuestFunction* function);
   void CallIndirect(const hir::Instr* instr, const Xbyak::Reg64& reg);
   void CallExtern(const hir::Instr* instr, const Function* function);
   void CallNative(void* fn);
@@ -288,6 +324,11 @@ class X64Emitter : public Xbyak::CodeGenerator {
   Xbyak::Reg64 GetContextReg() const;
   Xbyak::Reg64 GetMembaseReg() const;
   bool CanUseMembaseLow32As0() const { return may_use_membase32_as_zero_reg_; }
+  // Whether SOURCE_OFFSET emits nothing that changes the flags.
+  bool SourceOffsetsPreserveFlags() const {
+    return !(debug_info_flags_ &
+             DebugInfoFlags::kDebugInfoTraceFunctionCoverage);
+  }
   void ReloadMembase();
 
   void nop(size_t length = 1);
@@ -315,6 +356,8 @@ class X64Emitter : public Xbyak::CodeGenerator {
     return (feature_flags_ & feature_flag) == feature_flag;
   }
 
+  // The label stays valid for the whole function, even as more tails are
+  // added, and a tail's callback may add tails of its own.
   Xbyak::Label& AddToTail(TailEmitCallback callback, uint32_t alignment = 0);
   Xbyak::Label& NewCachedLabel();
 
@@ -440,7 +483,8 @@ class X64Emitter : public Xbyak::CodeGenerator {
     which would have to represent 0 as 4 bytes
   */
   bool may_use_membase32_as_zero_reg_;
-  std::vector<TailEmitter> tail_code_;
+  // A deque, so adding a tail doesn't move the labels already handed out
+  std::deque<TailEmitter> tail_code_;
   std::vector<Xbyak::Label*>
       label_cache_;  // for creating labels that need to be referenced much
                      // later by tail emitters

@@ -11,6 +11,8 @@
 #define XENIA_APP_PROFILE_DIALOGS_H_
 
 #include <future>
+#include <memory>
+#include <set>
 
 #include "xenia/kernel/json/session_object_json.h"
 #include "xenia/kernel/xam/ui/friends_ui.h"
@@ -58,6 +60,10 @@ class ProfileConfigDialog final : public ui::ImGuiDialog {
 
   std::map<uint64_t, std::unique_ptr<ui::ImmediateTexture>> profile_icon_;
   std::map<uint64_t, kernel::xam::GamerPictureKey> profile_gamerpic_key_;
+
+  std::vector<std::unique_ptr<ui::ImmediateTexture>> released_icons_;
+  std::shared_ptr<std::set<uint64_t>> pending_icon_reloads_ =
+      std::make_shared<std::set<uint64_t>>();
 
   uint64_t selected_xuid_ = 0;
   uint8_t signed_in_profiles_count_ = 0;

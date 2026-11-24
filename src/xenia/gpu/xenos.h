@@ -451,15 +451,19 @@ constexpr uint32_t kRenderTargetFormatBits =
 
 constexpr uint32_t kEdramTileWidthSamples = 80;
 constexpr uint32_t kEdramTileHeightSamples = 16;
+constexpr uint32_t kEdramTileSizeBytes =
+    kEdramTileHeightSamples * kEdramTileWidthSamples * sizeof(uint32_t);
+// Xenos has 2048 tiles with periodic 11 bit addressing.
+// The optional extended edram_tile_count emulates four times that for
+// title-specific patches that render past 10 MB, RB_COLOR_INFO::color_base and
+// RB_DEPTH_INFO::depth_base have room for 13 bit bases. Everything sized at
+// runtime takes the count from the render target cache.
 constexpr uint32_t kEdramTileCount = 2048;
-constexpr uint32_t kEdramSizeBytes = kEdramTileCount * kEdramTileHeightSamples *
-                                     kEdramTileWidthSamples * sizeof(uint32_t);
+constexpr uint32_t kEdramBaseTilesBits = 13;
+constexpr uint32_t kEdramTileCountMax = uint32_t(1) << kEdramBaseTilesBits;
 
 // RB_SURFACE_INFO::surface_pitch width.
 constexpr uint32_t kEdramPitchPixelsBits = 14;
-// The part of RB_COLOR_INFO::color_base and RB_DEPTH_INFO::depth_base width
-// usable on the Xenos, which has periodic 11-bit EDRAM tile addressing.
-constexpr uint32_t kEdramBaseTilesBits = 11;
 
 constexpr uint32_t GetSurfacePitchTiles(uint32_t pitch_pixels,
                                         MsaaSamples msaa_samples,
@@ -494,18 +498,11 @@ enum class TextureFormat : uint32_t {
   k_6_5_5 = 5,
   k_8_8_8_8 = 6,
   k_2_10_10_10 = 7,
-  // Possibly similar to k_8, but may be storing alpha instead of red when
-  // resolving/memexporting, though not exactly known. From the point of view of
-  // sampling, it should be treated the same as k_8 (given that textures have
-  // the last - and single-component textures have the only - component
-  // replicated into all the remaining ones before the swizzle).
+  // Aliases of k_8.
   // Used as:
   // - Texture in 4B4E083C - text, starting from the "Loading..." and the "This
   //   game saves data automatically" messages. The swizzle in the fetch
-  //   constant is 111W (suggesting that internally the only component may be
-  //   the alpha one, not red).
-  // TODO(Triang3l): Investigate how k_8_A and k_8_B work in resolves and
-  // memexports, whether they store alpha/blue of the input or red.
+  //   constant is 111W.
   k_8_A = 8,
   k_8_B = 9,
   k_8_8 = 10,
@@ -519,7 +516,7 @@ enum class TextureFormat : uint32_t {
   // Used for videos in 54540829.
   k_Y1_Cr_Y0_Cb_REP = 12,
   k_16_16_EDRAM = 13,
-  // Likely same as k_8_8_8_8.
+  // Alias of k_8_8_8_8.
   // Used as:
   // - Memexport destination in 4D5308BC - multiple small draws when looking
   //   back at the door behind the player in the first room of gameplay.
@@ -620,7 +617,6 @@ constexpr bool IsColorResolveFormatBitwiseEquivalent(
     // title that keeps the encoding to fetch it back with kGamma re-aliases the
     // surface as k_8_8_8_8.
     case ColorRenderTargetFormat::k_8_8_8_8_GAMMA:
-      // TODO(Triang3l): Investigate k_8_8_8_8_A.
       return color_format == ColorFormat::k_8_8_8_8 ||
              color_format == ColorFormat::k_8_8_8_8_A ||
              color_format == ColorFormat::k_8_8_8_8_AS_16_16_16_16;

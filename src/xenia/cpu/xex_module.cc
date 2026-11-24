@@ -49,8 +49,6 @@ DEFINE_bool(
 
 DECLARE_bool(allow_plugins);
 
-DECLARE_bool(disable_context_promotion);
-
 static constexpr uint8_t xe_xex1_retail_key[16] = {
     0xA2, 0x6C, 0x10, 0xF7, 0x1F, 0xD9, 0x35, 0xE9,
     0x8B, 0x99, 0x92, 0x2C, 0xE9, 0x32, 0x15, 0x72};
@@ -237,7 +235,12 @@ int XexModule::ApplyPatch(XexModule* module) {
   xex2_opt_delta_patch_descriptor* patch_header = nullptr;
   GetOptHeader(XEX_HEADER_DELTA_PATCH_DESCRIPTOR,
                reinterpret_cast<void**>(&patch_header));
-  assert_not_null(patch_header);
+  if (!patch_header) {
+    // is_patch() only checks the module flags, so a malformed patch file can
+    // still lack the descriptor.
+    XELOGE("XEX patch has no delta patch descriptor");
+    return 1;
+  }
 
   uint32_t size = module->xex_header()->header_size;
   if (patch_header->delta_headers_source_offset > size) {
@@ -662,12 +665,21 @@ int XexModule::ReadImageBasicCompressed(const void* xex_addr,
     const uint32_t data_size = comp_info.blocks[n].data_size;
     const uint32_t zero_size = comp_info.blocks[n].zero_size;
 
+    // Block sizes come from the file. Decryption works in 16-byte blocks.
+    const size_t copy_size =
+        opt_file_format_info()->encryption_type == XEX_ENCRYPTION_NORMAL
+            ? xe::align<size_t>(data_size, 16)
+            : data_size;
+    const size_t source_offset = size_t(p - source_buffer);
+    const size_t dest_offset = size_t(d - buffer);
+    if (copy_size > exe_length - source_offset || dest_offset > total_size ||
+        copy_size > total_size - dest_offset) {
+      XELOGE("XEX basic compression block {} is out of bounds", n);
+      return 1;
+    }
+
     switch (opt_file_format_info()->encryption_type) {
       case XEX_ENCRYPTION_NONE:
-        if (data_size > uncompressed_size - (d - buffer)) {
-          // Overflow.
-          return 1;
-        }
         memcpy(d, p, data_size);
         break;
       case XEX_ENCRYPTION_NORMAL: {
@@ -1409,10 +1421,7 @@ std::unique_ptr<Function> XexModule::CreateFunction(uint32_t address) {
       processor_->backend()->CreateGuestFunction(this, address));
 }
 void XexInfoCache::Init(XexModule* xexmod) {
-  // If context promotion is disabled then disable instruction info cache as
-  // well, otherwise XMA will write to unknown registers.
-  if (cvars::disable_instruction_infocache ||
-      cvars::disable_context_promotion) {
+  if (cvars::disable_instruction_infocache) {
     return;
   }
 

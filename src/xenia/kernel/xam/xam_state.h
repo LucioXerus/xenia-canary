@@ -18,6 +18,7 @@
 #include "xenia/kernel/xam/friends_manager.h"
 #include "xenia/kernel/xam/presence_manager.h"
 #include "xenia/kernel/xam/profile_manager.h"
+#include "xenia/kernel/xam/ui_input_filter.h"
 #include "xenia/kernel/xam/user_tracker.h"
 #include "xenia/kernel/xam/xam.h"
 
@@ -69,7 +70,10 @@ class XamState {
 
   void SetContentRegisterCallback(uint32_t callback);
 
-  bool IsUIActive() const { return is_xam_dialog_present_.load(); }
+  bool IsUIActive() const { return ui_active_.load(); }
+  void SetUIActive(bool active);
+
+  UIInputFilter& ui_input_filter() { return ui_input_filter_; }
 
   uint32_t GetOnlineSchemaAddress() const { return online_schema_data_address; }
 
@@ -85,8 +89,6 @@ class XamState {
   uint32_t dash_backstack_nodes_count_ = 0;
   X_DASH_BACKSTACK_DATA dash_backstack_data_[2] = {};
   uint32_t content_register_callback = 0;
-
-  std::atomic<bool> is_xam_dialog_present_ = false;
 
  private:
   void LoadOnlineSchema();
@@ -106,6 +108,9 @@ class XamState {
   std::unique_ptr<PresenceManager> presence_manager_;
 
   std::unique_ptr<SpaInfo> spa_info_;
+
+  std::atomic<bool> ui_active_ = false;
+  UIInputFilter ui_input_filter_;
 
   // Custom XAM stuff
   uint32_t online_schema_data_address;

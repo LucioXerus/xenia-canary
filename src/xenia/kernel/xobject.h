@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
+#include <optional>
 #include <string>
 
 #include "xenia/base/threading.h"
@@ -30,6 +31,9 @@ namespace kernel {
 constexpr fourcc_t kXObjSignature = make_fourcc('X', 'E', 'N', '\0');
 
 class KernelState;
+namespace util {
+class ObjectTable;
+}  // namespace util
 
 template <typename T>
 class object_ref;
@@ -195,6 +199,9 @@ class XObject {
 
   void RetainHandle();
   bool ReleaseHandle();
+  // Copies the counts into the object header, when the object has one of
+  // its own from CreateNative
+  void SetNativeCounts(int32_t pointer_count, int32_t handle_count);
   void Retain();
   void Release();
   X_STATUS Delete();
@@ -222,6 +229,8 @@ class XObject {
                                uint32_t wait_type, uint32_t wait_reason,
                                uint32_t processor_mode, uint32_t alertable,
                                uint64_t* opt_timeout);
+
+  static std::optional<int64_t> MsToTimeoutTicks(uint32_t milliseconds);
 
   static object_ref<XObject> GetNativeObject(
       KernelState* kernel_state, void* native_ptr,
@@ -272,6 +281,10 @@ class XObject {
   bool host_object_ = false;
 
  private:
+  friend class util::ObjectTable;
+  // Called under the object-table lock after a slot loses its last reference.
+  void UpdateNativeHandle(X_HANDLE removed_handle);
+
   std::atomic<int32_t> pointer_ref_count_;
 
   Type type_;
@@ -282,7 +295,7 @@ class XObject {
   // if we allocated it!
   uint32_t guest_object_ptr_ = 0;
   bool allocated_guest_object_ = false;
-
+  // Guest type recorded by ObOpenObjectByPointer.
   std::atomic<uint32_t> guest_object_type_ptr_{0};
 };
 

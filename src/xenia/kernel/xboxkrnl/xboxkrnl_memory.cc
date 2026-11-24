@@ -9,9 +9,11 @@
 
 #include "xenia/kernel/xboxkrnl/xboxkrnl_memory.h"
 #include "xenia/base/logging.h"
+#include "xenia/base/memory.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
+#include "xenia/kernel/xboxkrnl/xboxkrnl_threading.h"
 #include "xenia/xbox.h"
 
 DEFINE_bool(
@@ -30,7 +32,8 @@ uint32_t ToXdkProtectFlags(uint32_t protect) {
     result = X_PAGE_NOACCESS;
   } else if ((protect & kMemoryProtectRead) &&
              !(protect & kMemoryProtectWrite)) {
-    result = X_PAGE_READONLY;
+    // A page made read-only reports PAGE_USER_READONLY too.
+    result = X_PAGE_READONLY | X_PAGE_USER_READONLY;
   } else {
     result = X_PAGE_READWRITE;
   }
@@ -138,8 +141,9 @@ dword_result_t NtAllocateVirtualMemory_entry(lpdword_t base_addr_ptr,
                                ? -int32_t(region_size_ptr.value())
                                : region_size_ptr.value();
 
-  adjusted_size =
-      xe::round_up(adjusted_size, adjusted_base ? page_size : 64 * 1024);
+  // The size is in pages, while an allocation without a base starts on a
+  // 64 KB boundary whatever its page size.
+  adjusted_size = xe::round_up(adjusted_size, page_size);
 
   // Allocate.
   uint32_t allocation_type = 0;
@@ -175,7 +179,7 @@ dword_result_t NtAllocateVirtualMemory_entry(lpdword_t base_addr_ptr,
   } else {
     bool top_down = !!(alloc_type & X_MEM_TOP_DOWN);
     heap = kernel_memory()->LookupHeapByType(false, page_size);
-    heap->Alloc(adjusted_size, page_size, allocation_type, protect, top_down,
+    heap->Alloc(adjusted_size, 64 * 1024, allocation_type, protect, top_down,
                 &address);
   }
   if (!address) {
@@ -252,7 +256,7 @@ dword_result_t NtProtectVirtualMemory_entry(lpdword_t base_addr_ptr,
   *region_size_ptr = adjusted_size;
 
   if (old_protect) {
-    *old_protect = tmp_old_protect;
+    *old_protect = ToXdkProtectFlags(tmp_old_protect);
   }
 
   return X_STATUS_SUCCESS;
@@ -332,7 +336,9 @@ dword_result_t NtQueryVirtualMemory_entry(
     return X_STATUS_INVALID_PARAMETER;
   }
 
-  memory_basic_information_ptr->base_address = alloc_info.base_address;
+  // The queried address is rounded down to its page.
+  memory_basic_information_ptr->base_address =
+      alloc_info.base_address & ~(heap->page_size() - 1);
   memory_basic_information_ptr->allocation_base = alloc_info.allocation_base;
   memory_basic_information_ptr->allocation_protect =
       ToXdkProtectFlags(alloc_info.allocation_protect);
@@ -351,37 +357,47 @@ dword_result_t NtQueryVirtualMemory_entry(
     x_state = X_MEM_FREE;
   }
   memory_basic_information_ptr->state = x_state;
-  memory_basic_information_ptr->protect = ToXdkProtectFlags(alloc_info.protect);
+  // Only committed pages have a protection.
+  memory_basic_information_ptr->protect =
+      x_state == X_MEM_COMMIT ? ToXdkProtectFlags(alloc_info.protect) : 0;
   memory_basic_information_ptr->type = X_MEM_PRIVATE;
 
   return X_STATUS_SUCCESS;
 }
 DECLARE_XBOXKRNL_EXPORT1(NtQueryVirtualMemory, kMemory, kImplemented);
 
-dword_result_t NtAllocateEncryptedMemory_entry(dword_t unk, dword_t region_size,
-                                               lpdword_t base_addr_ptr) {
-  if (!region_size) {
+dword_result_t NtAllocateEncryptedMemory_entry(dword_t region_type,
+                                               dword_t region_size,
+                                               lpdword_t base_addr_ptr,
+                                               const ppc_context_t& context) {
+  if (region_type > X_PROCTYPE_SYSTEM) {
     return X_STATUS_INVALID_PARAMETER;
   }
 
-  const uint32_t region_size_adjusted =
-      xe::round_up(region_size, 64 * 1024, true);
+  const EncryptedMemoryRegion& region =
+      (region_type ? uint32_t(region_type)
+                   : xeKeGetCurrentProcessType(context)) == X_PROCTYPE_TITLE
+          ? kTitleEncryptedMemoryRegion
+          : kSystemEncryptedMemoryRegion;
 
-  if (region_size_adjusted > 16 * 1024 * 1024) {
+  auto heap = kernel_memory()->LookupHeap(region.base);
+  const uint32_t region_size_adjusted =
+      xe::round_up(region_size, heap->page_size(), false);
+
+  if (!region_size_adjusted || region_size_adjusted > region.size) {
     return X_STATUS_INVALID_PARAMETER;
   }
 
   uint32_t out_address = 0;
-  auto heap = kernel_memory()->LookupHeap(0x8C000000);
-  const bool result =
-      heap->AllocRange(0x8C000000, 0x8FFFFFFF, region_size_adjusted, 64 * 1024,
-                       MemoryAllocationFlag::kMemoryAllocationCommit,
-                       MemoryProtectFlag::kMemoryProtectRead |
-                           MemoryProtectFlag::kMemoryProtectWrite,
-                       false, &out_address);
+  const bool result = heap->AllocRange(
+      region.base, region.base + region.size - 1, region_size_adjusted,
+      heap->page_size(), MemoryAllocationFlag::kMemoryAllocationCommit,
+      MemoryProtectFlag::kMemoryProtectRead |
+          MemoryProtectFlag::kMemoryProtectWrite,
+      false, &out_address);
 
   if (!result) {
-    return X_STATUS_UNSUCCESSFUL;
+    return X_STATUS_NO_MEMORY;
   }
 
   XELOGD("NtAllocateEncryptedMemory = {:08X}", out_address);
@@ -391,22 +407,40 @@ dword_result_t NtAllocateEncryptedMemory_entry(dword_t unk, dword_t region_size,
 DECLARE_XBOXKRNL_EXPORT1(NtAllocateEncryptedMemory, kMemory, kImplemented);
 
 dword_result_t NtFreeEncryptedMemory_entry(dword_t region_type,
-                                           lpdword_t base_address_ptr) {
-  if (!base_address_ptr) {
+                                           dword_t base_address,
+                                           const ppc_context_t& context) {
+  if (region_type > X_PROCTYPE_SYSTEM) {
     return X_STATUS_INVALID_PARAMETER;
   }
 
-  auto heap = kernel_state()->memory()->LookupHeap(0x80000000);
-  const uint32_t encrypt_address =
-      heap->heap_base() + heap->page_size() * (*base_address_ptr);
+  const EncryptedMemoryRegion& region =
+      (region_type ? uint32_t(region_type)
+                   : xeKeGetCurrentProcessType(context)) == X_PROCTYPE_TITLE
+          ? kTitleEncryptedMemoryRegion
+          : kSystemEncryptedMemoryRegion;
 
-  auto encrypt_heap = kernel_state()->memory()->LookupHeap(encrypt_address);
-
-  if (encrypt_heap->heap_type() != HeapType::kGuestXex) {
+  if (!region.Contains(base_address)) {
     return X_STATUS_INVALID_PARAMETER;
   }
 
-  kernel_state()->memory()->SystemHeapFree(encrypt_address);
+  auto heap = kernel_memory()->LookupHeap(region.base);
+
+  // The page the address rounds up to has to start an allocation.
+  const uint32_t page_address =
+      xe::round_up(uint32_t(base_address), heap->page_size());
+  HeapAllocationInfo info;
+
+  if (!region.Contains(page_address) ||
+      !heap->QueryRegionInfo(page_address, &info) || !info.state ||
+      info.allocation_base != page_address) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+
+  if (base_address != page_address) {
+    return X_STATUS_FREE_VM_NOT_AT_BASE;
+  }
+
+  heap->Release(page_address);
 
   return X_STATUS_SUCCESS;
 }
@@ -421,9 +455,18 @@ uint32_t xeMmAllocatePhysicalMemoryEx(uint32_t flags, uint32_t region_size,
   // by D3D/etc.
 
   // Check protection bits.
-  if (!(protect_bits & (X_PAGE_READONLY | X_PAGE_READWRITE))) {
-    XELOGE("MmAllocatePhysicalMemoryEx: bad protection bits");
-    return 0;
+  // 54540817 passes X_MEM_LARGE_PAGES | X_PAGE_WRITECOMBINE with no access
+  // bits for its front buffer, so treat a missing access mode as read/write.
+  const uint32_t kAccessProtectBits = X_PAGE_READONLY | X_PAGE_READWRITE |
+                                      X_PAGE_EXECUTE_READ |
+                                      X_PAGE_EXECUTE_READWRITE;
+
+  if (!(protect_bits & kAccessProtectBits)) {
+    XELOGW(
+        "MmAllocatePhysicalMemoryEx: no access mode in protection bits {:08X} "
+        "(flags {:08X}, size {:08X}), assuming read/write",
+        protect_bits, flags, region_size);
+    protect_bits |= X_PAGE_READWRITE;
   }
 
   // Either may be OR'ed into protect_bits:
@@ -516,7 +559,12 @@ DECLARE_XBOXKRNL_EXPORT1(MmFreePhysicalMemory, kMemory, kImplemented);
 dword_result_t MmQueryAddressProtect_entry(dword_t base_address) {
   auto heap = kernel_state()->memory()->LookupHeap(base_address);
   uint32_t access;
-  if (!heap->QueryProtect(base_address, &access)) {
+  uint32_t state = 0;
+  if (!heap->QueryProtect(base_address, &access, &state)) {
+    access = 0;
+  }
+  // Only committed pages have a protection.
+  if (!(state & kMemoryAllocationCommit)) {
     access = 0;
   }
   access = !access ? 0 : ToXdkProtectFlags(access);
@@ -573,7 +621,7 @@ dword_result_t xeMmQueryStatistics(
   const uint32_t size = sizeof(X_MM_QUERY_STATISTICS_RESULT);
 
   if (stats_ptr->size != size) {
-    return X_STATUS_BUFFER_TOO_SMALL;
+    return X_STATUS_INVALID_PARAMETER;
   }
 
   // Zero out the struct.
@@ -708,7 +756,7 @@ DECLARE_XBOXKRNL_EXPORT1(ExAllocatePoolWithTag, kMemory, kImplemented);
 
 dword_result_t ExAllocatePool_entry(dword_t size,
                                     const ppc_context_t& context) {
-  constexpr uint32_t none = 0x656E6F4E;  // 'None'
+  constexpr fourcc_t none = make_fourcc("None");
   return xeAllocatePoolTypeWithTag(context, size, none, 0);
 }
 DECLARE_XBOXKRNL_EXPORT1(ExAllocatePool, kMemory, kImplemented);
@@ -770,18 +818,25 @@ DECLARE_XBOXKRNL_EXPORT2(KeLockL2, kMemory, kImplemented, kSketchy);
 void KeUnlockL2_entry() {}
 DECLARE_XBOXKRNL_EXPORT1(KeUnlockL2, kMemory, kStub);
 
-uint32_t xeMmCreateKernelStack(uint32_t stack_size, uint32_t r4) {
-  auto stack_size_aligned = (stack_size + 0xFFF) & 0xFFFFF000;
-  uint32_t stack_alignment = (stack_size & 0xF000) ? 0x1000 : 0x10000;
+// Returns the top of a stack of the size rounded up to the page. Type 0 is
+// the caller's process, 1 a title's and 2 the system's; any other type gets
+// no stack.
+uint32_t xeMmCreateKernelStack(uint32_t stack_size, uint32_t type) {
+  if (type > 2) {
+    return 0;
+  }
+
+  const uint32_t stack_size_aligned = xe::round_up(stack_size, 0x1000u);
+  auto heap = kernel_memory()->LookupHeap(0x70000000);
 
   uint32_t stack_address;
-  kernel_memory()
-      ->LookupHeap(0x70000000)
-      ->AllocRange(0x70000000, 0x7F000000, stack_size_aligned, stack_alignment,
-                   kMemoryAllocationReserve | kMemoryAllocationCommit,
-                   kMemoryProtectRead | kMemoryProtectWrite, false,
-                   &stack_address);
-  return stack_address + stack_size;
+  if (!heap->AllocRange(
+          0x70000000, 0x7F000000, stack_size_aligned, heap->page_size(),
+          kMemoryAllocationReserve | kMemoryAllocationCommit,
+          kMemoryProtectRead | kMemoryProtectWrite, false, &stack_address)) {
+    return 0;
+  }
+  return stack_address + stack_size_aligned;
 }
 dword_result_t MmCreateKernelStack_entry(dword_t stack_size, dword_t r4) {
   return xeMmCreateKernelStack(stack_size, r4);
@@ -791,7 +846,8 @@ DECLARE_XBOXKRNL_EXPORT1(MmCreateKernelStack, kMemory, kImplemented);
 dword_result_t MmDeleteKernelStack_entry(lpvoid_t stack_base,
                                          lpvoid_t stack_end) {
   // Release the stack (where stack_end is the low address)
-  if (kernel_memory()->LookupHeap(0x70000000)->Release(stack_end)) {
+  auto heap = kernel_memory()->LookupHeap(stack_end.guest_address());
+  if (heap && heap->Release(stack_end)) {
     return X_STATUS_SUCCESS;
   }
 

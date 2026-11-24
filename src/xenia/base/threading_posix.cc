@@ -24,10 +24,13 @@
 #include <linux/futex.h>
 #endif
 #include <unistd.h>
+#include <algorithm>
 #include <array>
+#include <atomic>
 #include <climits>
 #include <cstddef>
 #include <ctime>
+#include <optional>
 
 #include "logging.h"
 
@@ -213,11 +216,81 @@ void NanoSleepPrecise(int64_t ns) {
 
 // TODO(bwrsandman) Implement by allowing alert interrupts from IO operations
 thread_local bool alertable_state_ = false;
-SleepResult AlertableSleep(std::chrono::microseconds duration) {
+thread_local bool user_callback_ran_ = false;
+
+bool RunPendingUserCallback();
+
+// A signal handler can't wake a condition wait, so an alertable wait waits in
+// slices and ends once a user callback has run, like on Windows.
+constexpr std::chrono::milliseconds kAlertableWaitSlice{5};
+
+template <typename WaitFunction>
+std::pair<WaitResult, size_t> AlertableWait(std::chrono::milliseconds timeout,
+                                            WaitFunction wait) {
+  if (RunPendingUserCallback()) {
+    return std::make_pair(WaitResult::kUserCallback, size_t(0));
+  }
+
+  const bool infinite = timeout == std::chrono::milliseconds::max();
+  const auto end_time = infinite ? std::chrono::steady_clock::time_point::max()
+                                 : std::chrono::steady_clock::now() + timeout;
+
+  user_callback_ran_ = false;
   alertable_state_ = true;
-  Sleep(duration);
+
+  std::pair<WaitResult, size_t> result;
+
+  while (true) {
+    auto slice = kAlertableWaitSlice;
+
+    if (!infinite) {
+      const auto remaining =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              end_time - std::chrono::steady_clock::now());
+      slice = std::clamp(remaining, std::chrono::milliseconds(0), slice);
+    }
+
+    result = wait(slice);
+
+    if (result.first != WaitResult::kTimeout) {
+      break;
+    }
+
+    if (user_callback_ran_) {
+      result = std::make_pair(WaitResult::kUserCallback, size_t(0));
+      break;
+    }
+
+    // A callback queued just before the wait became alertable was left
+    // pending by the signal handler. Run it here, not alertable, so the
+    // handler can't run it at the same time.
+    alertable_state_ = false;
+    const bool ran_pending = RunPendingUserCallback();
+    alertable_state_ = true;
+    if (ran_pending) {
+      result = std::make_pair(WaitResult::kUserCallback, size_t(0));
+      break;
+    }
+
+    if (!infinite && std::chrono::steady_clock::now() >= end_time) {
+      break;
+    }
+  }
+
   alertable_state_ = false;
-  return SleepResult::kSuccess;
+  return result;
+}
+
+SleepResult AlertableSleep(std::chrono::microseconds duration) {
+  auto result =
+      AlertableWait(std::chrono::ceil<std::chrono::milliseconds>(duration),
+                    [](std::chrono::milliseconds slice) {
+                      Sleep(slice);
+                      return std::make_pair(WaitResult::kTimeout, size_t(0));
+                    });
+
+  return result.first == WaitResult::kUserCallback ? SleepResult::kAlerted
+                                                   : SleepResult::kSuccess;
 }
 
 TlsHandle AllocateTlsHandle() {
@@ -291,9 +364,18 @@ class PosixConditionBase {
   virtual ~PosixConditionBase() = default;
   virtual bool Signal() = 0;
 
-  WaitResult Wait(std::chrono::milliseconds timeout) {
+  // Counts the releases that free every waiter at once, such as setting a
+  // manual-reset event. A waiter that saw the count change is released even
+  // if the object was reset before it ran.
+  [[nodiscard]] uint64_t release_count() const {
+    return release_count_.load(std::memory_order_acquire);
+  }
+
+  // Pass since to keep counting releases from an earlier wait, as the slices
+  // of an alertable wait do.
+  WaitResult Wait(std::chrono::milliseconds timeout,
+                  std::optional<uint64_t> since = std::nullopt) {
     bool executed;
-    auto predicate = [this] { return this->signaled(); };
 
     // Handle robust mutex locking
     auto native_mutex = static_cast<pthread_mutex_t*>(mutex_.native_handle());
@@ -307,6 +389,11 @@ class PosixConditionBase {
 
     std::unique_lock<std::mutex> lock(mutex_, std::adopt_lock);
 
+    const uint64_t start = since ? *since : release_count();
+    auto predicate = [this, start] {
+      return this->signaled() || release_count() != start;
+    };
+
     if (predicate()) {
       executed = true;
     } else {
@@ -319,19 +406,25 @@ class PosixConditionBase {
     }
     if (executed) {
       post_execution();
-      return WaitResult::kSuccess;
+      return TakeAbandoned() ? WaitResult::kAbandoned : WaitResult::kSuccess;
     }
     return WaitResult::kTimeout;
   }
 
+  // since holds each handle's release count from an earlier wait, as the
+  // slices of an alertable wait pass it.
   static std::pair<WaitResult, size_t> WaitMultiple(
       std::vector<PosixConditionBase*>&& handles, bool wait_all,
-      std::chrono::milliseconds timeout) {
+      std::chrono::milliseconds timeout,
+      const std::vector<uint64_t>* since = nullptr) {
     assert_true(!handles.empty());
+
+    const std::vector<uint64_t> start_counts =
+        since ? *since : ReleaseCounts(handles);
 
     // For single handle, just use the normal Wait path
     if (handles.size() == 1) {
-      auto result = handles[0]->Wait(timeout);
+      auto result = handles[0]->Wait(timeout, start_counts[0]);
       return std::make_pair(result, 0);
     }
 
@@ -407,9 +500,10 @@ class PosixConditionBase {
         }
         condition_met = all_signaled;
       } else {
-        // For wait_any, check if ANY is signaled
+        // For wait_any, check if ANY is signaled or was released
         for (size_t i = 0; i < handles.size(); ++i) {
-          if (handles[i]->signaled()) {
+          if (handles[i]->signaled() ||
+              handles[i]->release_count() != start_counts[i]) {
             first_signaled = i;
             condition_met = true;
             break;
@@ -420,11 +514,22 @@ class PosixConditionBase {
       if (condition_met) {
         // Execute post_execution for the signaled handle(s)
         if (wait_all) {
+          size_t abandoned = std::numeric_limits<size_t>::max();
           for (size_t i = 0; i < handles.size(); ++i) {
             handles[i]->post_execution();
+            if (handles[i]->TakeAbandoned() &&
+                abandoned == std::numeric_limits<size_t>::max()) {
+              abandoned = i;
+            }
+          }
+          if (abandoned != std::numeric_limits<size_t>::max()) {
+            return std::make_pair(WaitResult::kAbandoned, abandoned);
           }
         } else {
           handles[first_signaled]->post_execution();
+          if (handles[first_signaled]->TakeAbandoned()) {
+            return std::make_pair(WaitResult::kAbandoned, first_signaled);
+          }
         }
         return std::make_pair(WaitResult::kSuccess, first_signaled);
       }
@@ -446,6 +551,16 @@ class PosixConditionBase {
     }
   }
 
+  static std::vector<uint64_t> ReleaseCounts(
+      const std::vector<PosixConditionBase*>& handles) {
+    std::vector<uint64_t> counts;
+    counts.reserve(handles.size());
+    for (auto handle : handles) {
+      counts.push_back(handle->release_count());
+    }
+    return counts;
+  }
+
   [[nodiscard]] virtual void* native_handle() const {
     return const_cast<std::condition_variable&>(cond_).native_handle();
   }
@@ -453,8 +568,14 @@ class PosixConditionBase {
  protected:
   [[nodiscard]] inline virtual bool signaled() const = 0;
   inline virtual void post_execution() = 0;
+
+  // True once for the wait that takes a mutant left by a thread that exited
+  // holding it.
+  virtual bool TakeAbandoned() { return false; }
+
   std::condition_variable cond_;
   std::mutex mutex_;
+  std::atomic<uint64_t> release_count_{0};
 };
 
 // There really is no native POSIX handle for a single wait/signal construct
@@ -474,6 +595,9 @@ class PosixCondition<Event> : public PosixConditionBase {
   bool Signal() override {
     auto lock = std::unique_lock(mutex_);
     signal_ = true;
+    if (manual_reset_) {
+      release_count_.fetch_add(1, std::memory_order_release);
+    }
     cond_.notify_all();
     NotifyMultiObjectWaiters();
     return true;
@@ -535,6 +659,55 @@ class PosixCondition<Semaphore> final : public PosixConditionBase {
   const uint32_t maximum_count_;
 };
 
+// The mutants a thread holds. When the thread exits, the ones it still holds
+// are abandoned, and the next wait to take each returns kAbandoned, as on
+// Windows. The lists are changed under one lock, which is never held while
+// taking a mutant's own lock, since waits take that lock first. An exiting
+// thread pins its mutants until it has abandoned them, so one destroyed
+// meanwhile waits.
+std::mutex owned_mutants_mutex;
+std::condition_variable owned_mutants_unpinned;
+
+// Threads can be cancelled at any point, so cancellation is held off while
+// owned_mutants_mutex is held, or a thread cancelled holding it would leave
+// every other thread's mutants stuck. Declare one before taking the lock.
+class OwnedMutantsCancelGuard {
+ public:
+  OwnedMutantsCancelGuard() {
+#if !XE_PLATFORM_ANDROID
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &previous_state_);
+#endif
+  }
+  ~OwnedMutantsCancelGuard() {
+#if !XE_PLATFORM_ANDROID
+    pthread_setcancelstate(previous_state_, nullptr);
+#endif
+  }
+
+ private:
+  int previous_state_ = 0;
+};
+
+template <>
+class PosixCondition<Mutant>;
+
+class OwnedMutants {
+ public:
+  ~OwnedMutants();
+
+  void Add(PosixCondition<Mutant>* mutant) { mutants_.push_back(mutant); }
+
+  void Remove(PosixCondition<Mutant>* mutant) {
+    mutants_.erase(std::remove(mutants_.begin(), mutants_.end(), mutant),
+                   mutants_.end());
+  }
+
+ private:
+  std::vector<PosixCondition<Mutant>*> mutants_;
+};
+
+thread_local OwnedMutants owned_mutants_;
+
 template <>
 class PosixCondition<Mutant> final : public PosixConditionBase {
  public:
@@ -542,7 +715,17 @@ class PosixCondition<Mutant> final : public PosixConditionBase {
     if (initial_owner) {
       count_ = 1;
       owner_ = std::this_thread::get_id();
+      SetOwnerList(&owned_mutants_);
     }
+  }
+
+  ~PosixCondition() override {
+    OwnedMutantsCancelGuard cancel_guard;
+    std::unique_lock lock(owned_mutants_mutex);
+    if (owner_list_) {
+      owner_list_->Remove(this);
+    }
+    owned_mutants_unpinned.wait(lock, [this] { return pins_ == 0; });
   }
 
   bool Signal() override { return Release(); }
@@ -553,12 +736,30 @@ class PosixCondition<Mutant> final : public PosixConditionBase {
       --count_;
       // Free to be acquired by another thread
       if (count_ == 0) {
+        SetOwnerList(nullptr);
         cond_.notify_all();
         NotifyMultiObjectWaiters();
       }
       return true;
     }
     return false;
+  }
+
+  // Pin and Unpin are called with owned_mutants_mutex held.
+  void Pin() {
+    owner_list_ = nullptr;
+    ++pins_;
+  }
+
+  void Unpin() { --pins_; }
+
+  void Abandon() {
+    std::lock_guard lock(mutex_);
+    count_ = 0;
+    owner_ = std::thread::id();
+    abandoned_ = true;
+    cond_.notify_all();
+    NotifyMultiObjectWaiters();
   }
 
   [[nodiscard]] void* native_handle() const override {
@@ -569,13 +770,59 @@ class PosixCondition<Mutant> final : public PosixConditionBase {
   [[nodiscard]] bool signaled() const override {
     return count_ == 0 || owner_ == std::this_thread::get_id();
   }
+
   void post_execution() override {
+    if (count_ == 0) {
+      SetOwnerList(&owned_mutants_);
+    }
     count_++;
     owner_ = std::this_thread::get_id();
   }
+
+  bool TakeAbandoned() override { return std::exchange(abandoned_, false); }
+
+  void SetOwnerList(OwnedMutants* list) {
+    OwnedMutantsCancelGuard cancel_guard;
+    std::lock_guard lock(owned_mutants_mutex);
+    if (owner_list_) {
+      owner_list_->Remove(this);
+    }
+    owner_list_ = list;
+    if (owner_list_) {
+      owner_list_->Add(this);
+    }
+  }
+
   uint32_t count_;
   std::thread::id owner_;
+  OwnedMutants* owner_list_ = nullptr;
+  uint32_t pins_ = 0;
+  bool abandoned_ = false;
 };
+
+OwnedMutants::~OwnedMutants() {
+  OwnedMutantsCancelGuard cancel_guard;
+  std::vector<PosixCondition<Mutant>*> mutants;
+  {
+    std::lock_guard lock(owned_mutants_mutex);
+    mutants.swap(mutants_);
+    for (auto mutant : mutants) {
+      mutant->Pin();
+    }
+  }
+
+  for (auto mutant : mutants) {
+    mutant->Abandon();
+  }
+
+  {
+    std::lock_guard lock(owned_mutants_mutex);
+    for (auto mutant : mutants) {
+      mutant->Unpin();
+    }
+  }
+  owned_mutants_unpinned.notify_all();
+}
 
 template <>
 class PosixCondition<Timer> final : public PosixConditionBase {
@@ -906,6 +1153,7 @@ class PosixCondition<Thread> final : public PosixConditionBase {
     WaitStarted();
     std::unique_lock lock(callback_mutex_);
     user_callback_ = std::move(callback);
+    callback_pending_ = true;
     sigval value{};
     value.sival_ptr = this;
 #if XE_PLATFORM_ANDROID
@@ -917,9 +1165,22 @@ class PosixCondition<Thread> final : public PosixConditionBase {
 #endif
   }
 
-  void CallUserCallback() const {
+  void CallUserCallback() {
     std::unique_lock lock(callback_mutex_);
-    user_callback_();
+    if (callback_pending_.exchange(false)) {
+      user_callback_();
+    }
+  }
+
+  // Runs a callback that was queued while the thread wasn't alertable, and
+  // so wasn't run by the signal handler.
+  bool RunPendingUserCallback() {
+    if (!callback_pending_) {
+      return false;
+    }
+
+    CallUserCallback();
+    return true;
   }
 
   bool Resume(uint32_t* out_previous_suspend_count = nullptr) {
@@ -1092,6 +1353,7 @@ class PosixCondition<Thread> final : public PosixConditionBase {
   mutable std::mutex callback_mutex_;
   mutable std::condition_variable state_signal_;
   std::function<void()> user_callback_;
+  std::atomic<bool> callback_pending_ = false;
 #if XE_PLATFORM_ANDROID
   // Name accessible via name() on Android before API 26 which added
   // pthread_getname_np.
@@ -1159,14 +1421,18 @@ WaitResult Wait(WaitHandle* wait_handle, bool is_alertable,
   if (posix_wait_handle == nullptr) {
     return WaitResult::kFailed;
   }
-  if (is_alertable) {
-    alertable_state_ = true;
+  auto& condition = posix_wait_handle->condition();
+  if (!is_alertable) {
+    return condition.Wait(timeout);
   }
-  auto result = posix_wait_handle->condition().Wait(timeout);
-  if (is_alertable) {
-    alertable_state_ = false;
-  }
-  return result;
+
+  const uint64_t since = condition.release_count();
+  return AlertableWait(timeout,
+                       [&](std::chrono::milliseconds slice) {
+                         return std::make_pair(condition.Wait(slice, since),
+                                               size_t(0));
+                       })
+      .first;
 }
 
 WaitResult SignalAndWait(WaitHandle* wait_handle_to_signal,
@@ -1181,16 +1447,22 @@ WaitResult SignalAndWait(WaitHandle* wait_handle_to_signal,
       posix_wait_handle_to_wait_on == nullptr) {
     return WaitResult::kFailed;
   }
-  if (is_alertable) {
-    alertable_state_ = true;
+  if (!posix_wait_handle_to_signal->condition().Signal()) {
+    return result;
   }
-  if (posix_wait_handle_to_signal->condition().Signal()) {
-    result = posix_wait_handle_to_wait_on->condition().Wait(timeout);
+
+  auto& condition = posix_wait_handle_to_wait_on->condition();
+  if (!is_alertable) {
+    return condition.Wait(timeout);
   }
-  if (is_alertable) {
-    alertable_state_ = false;
-  }
-  return result;
+
+  const uint64_t since = condition.release_count();
+  return AlertableWait(timeout,
+                       [&](std::chrono::milliseconds slice) {
+                         return std::make_pair(condition.Wait(slice, since),
+                                               size_t(0));
+                       })
+      .first;
 }
 
 std::pair<WaitResult, size_t> WaitMultiple(WaitHandle* wait_handles[],
@@ -1206,15 +1478,16 @@ std::pair<WaitResult, size_t> WaitMultiple(WaitHandle* wait_handles[],
     }
     conditions.push_back(&handle->condition());
   }
-  if (is_alertable) {
-    alertable_state_ = true;
+  if (!is_alertable) {
+    return PosixConditionBase::WaitMultiple(std::move(conditions), wait_all,
+                                            timeout);
   }
-  auto result = PosixConditionBase::WaitMultiple(std::move(conditions),
-                                                 wait_all, timeout);
-  if (is_alertable) {
-    alertable_state_ = false;
-  }
-  return result;
+
+  const auto since = PosixConditionBase::ReleaseCounts(conditions);
+  return AlertableWait(timeout, [&](std::chrono::milliseconds slice) {
+    return PosixConditionBase::WaitMultiple(
+        std::vector<PosixConditionBase*>(conditions), wait_all, slice, &since);
+  });
 }
 
 class PosixEvent final : public PosixConditionHandle<Event> {
@@ -1371,6 +1644,8 @@ class PosixThread final : public PosixConditionHandle<Thread> {
     handle_.QueueUserCallback(std::move(callback));
   }
 
+  bool RunPendingUserCallback() { return handle_.RunPendingUserCallback(); }
+
   bool Resume(uint32_t* out_previous_suspend_count) override {
     return handle_.Resume(out_previous_suspend_count);
   }
@@ -1385,6 +1660,10 @@ class PosixThread final : public PosixConditionHandle<Thread> {
 };
 
 thread_local PosixThread* current_thread_ = nullptr;
+
+bool RunPendingUserCallback() {
+  return current_thread_ && current_thread_->RunPendingUserCallback();
+}
 
 void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
 #if !XE_PLATFORM_ANDROID
@@ -1509,6 +1788,7 @@ static void signal_handler(int signal, siginfo_t* info, void* context) {
           static_cast<PosixCondition<Thread>*>(info->si_value.sival_ptr);
       if (alertable_state_) {
         p_thread->CallUserCallback();
+        user_callback_ran_ = true;
       }
     } break;
 #if XE_PLATFORM_ANDROID

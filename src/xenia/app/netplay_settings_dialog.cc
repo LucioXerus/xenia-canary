@@ -48,7 +48,7 @@ void NetplaySettingsDialog::OnDraw(ImGuiIO& io) {
   if (ImGui::BeginPopupModal(
           "Netplay Settings", &dialog_opened_,
           ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove)) {
-    ImGui::SetWindowFontScale(1.05f);
+    ImGui::PushFont(nullptr, imgui_drawer()->GetFontSize() * 1.05f);
 
     const auto emulator = emulator_window_->emulator();
     const auto kernel_state = emulator->kernel_state();
@@ -273,7 +273,7 @@ void NetplaySettingsDialog::OnDraw(ImGuiIO& io) {
       ImVec2 desc_size = ImGui::CalcTextSize(desc.c_str());
 
       ImGui::SetCursorPosX((ImGui::GetWindowWidth() - desc_size.x) * 0.5f);
-      ImGui::Text(desc.c_str());
+      ImGui::Text("%s", desc.c_str());
 
       ImGui::Separator();
 
@@ -367,7 +367,7 @@ void NetplaySettingsDialog::OnDraw(ImGuiIO& io) {
       ImGui::EndPopup();
     }
 
-    ImGui::SetWindowFontScale(1.0f);
+    ImGui::PopFont();
 
     ImGui::EndPopup();
   }
@@ -492,7 +492,7 @@ void NetplayStatusDialog::OnDraw(ImGuiIO& io) {
       ImGui::CloseCurrentPopup();
     }
 
-    ImGui::SetWindowFontScale(1.10f);
+    ImGui::PushFont(nullptr, imgui_drawer()->GetFontSize() * 1.10f);
 
     const auto emulator = emulator_window_->emulator();
     const auto kernel_state = emulator->kernel_state();
@@ -532,17 +532,17 @@ void NetplayStatusDialog::OnDraw(ImGuiIO& io) {
       upnp_state = "UPnP: Disabled";
     }
 
-    ImGui::Text(xlive_api_state.c_str());
+    ImGui::Text("%s", xlive_api_state.c_str());
     ImGui::Spacing();
 
-    ImGui::Text(upnp_state.c_str());
+    ImGui::Text("%s", upnp_state.c_str());
     ImGui::Spacing();
 
     if (is_failed) {
       ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(240, 50, 50, 255));
     }
 
-    ImGui::Text(api_server_state.c_str());
+    ImGui::Text("%s", api_server_state.c_str());
 
     if (!is_pending) {
       // We need to use a separate thread otherwise window will freeze.
@@ -567,7 +567,7 @@ void NetplayStatusDialog::OnDraw(ImGuiIO& io) {
       ImGui::PopStyleColor(2);
     }
 
-    ImGui::SetWindowFontScale(1.0f);
+    ImGui::PopFont();
 
     ImGui::EndPopup();
   }

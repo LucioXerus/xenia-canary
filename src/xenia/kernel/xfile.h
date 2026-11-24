@@ -12,7 +12,10 @@
 
 #include <mutex>
 #include <string>
+#include <string_view>
 
+#include "xenia/base/string.h"
+#include "xenia/base/utf8.h"
 #include "xenia/kernel/xiocompletion.h"
 #include "xenia/vfs/device.h"
 #include "xenia/vfs/entry.h"
@@ -71,6 +74,20 @@ class X_FILE_DIRECTORY_INFORMATION {
     } while (right->next_entry_offset != 0);
   }
 };
+
+// Strips \??\ or \System??\, the drive directories of titles and of the
+// system, from a full name. Both hold the same drives here. ? isn't allowed in
+// a path, so this comes before IsValidPath. The name isn't validated yet and
+// may not be UTF-8, so the prefixes are compared as ASCII bytes.
+static std::string_view StripDosDevicesPrefix(std::string_view path) {
+  for (const std::string_view prefix : {"\\??\\", "\\System??\\"}) {
+    if (path.size() >= prefix.size() &&
+        !xe_strncasecmp(path.data(), prefix.data(), prefix.size())) {
+      return path.substr(prefix.size());
+    }
+  }
+  return path;
+}
 
 static bool IsValidPath(const std::string_view s, bool is_pattern) {
   // TODO(gibbed): validate path components individually

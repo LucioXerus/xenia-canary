@@ -122,6 +122,12 @@ bool XmaContextNew::Work() {
   XMA_CONTEXT_DATA data(context_ptr);
   const XMA_CONTEXT_DATA initial_data = data;
 
+  // A read offset this decoder didn't store means the game set a decode
+  // position, so drop what is left of the frame it was decoding.
+  if (data.input_buffer_read_offset != last_stored_read_offset_) {
+    current_frame_remaining_subframes_ = 0;
+  }
+
   if (!data.output_buffer_valid) {
     return true;
   }
@@ -153,24 +159,28 @@ bool XmaContextNew::Work() {
   // formula) was far too restrictive: games like TGM Ace use
   // subframe_decode_count=2 on a small ring buffer and never had 8 free
   // blocks available, causing the decoder to permanently stall.
+  // Re-read each pass: Decode() clears output_buffer_padding once it has
+  // skipped a decode position's leading subframes.
   const uint32_t effective_sdc =
       std::max(static_cast<uint32_t>(1), data.subframe_decode_count);
-  const int32_t minimum_subframe_decode_count =
-      static_cast<int32_t>(effective_sdc) + data.output_buffer_padding;
+  const auto minimum_subframe_decode_count = [&]() {
+    return static_cast<int32_t>(effective_sdc) +
+           static_cast<int32_t>(data.output_buffer_padding);
+  };
 
   // We don't have enough space to even make one pass
   // Waiting for decoder to return more space.
-  if (minimum_subframe_decode_count >
+  if (minimum_subframe_decode_count() >
       remaining_subframe_blocks_in_output_buffer_) {
     XELOGAPU("XmaContext {}: No space for subframe decoding {}/{}!", id(),
-             minimum_subframe_decode_count,
+             minimum_subframe_decode_count(),
              remaining_subframe_blocks_in_output_buffer_);
     StoreContextMerged(data, initial_data, context_ptr);
     return true;
   }
 
   while (remaining_subframe_blocks_in_output_buffer_ >=
-         minimum_subframe_decode_count) {
+         minimum_subframe_decode_count()) {
     XELOGAPU(
         "XmaContext {}: Write Count: {}, Capacity: {} - {} {} Subframes: {} "
         "Padding: {}",
@@ -268,6 +278,11 @@ void XmaContextNew::ClearLocked(XMA_CONTEXT_DATA* data) {
   current_frame_remaining_subframes_ = 0;
   loop_frame_output_limit_ = 0;
   loop_start_skip_pending_ = false;
+  last_stored_read_offset_ = UINT32_MAX;
+
+  // Flushing keeps the decoder's overlap history, so recreate the decoder for
+  // the next stream.
+  reset_decoder_ = true;
 }
 
 void XmaContextNew::Disable() { set_is_enabled(false); }
@@ -279,6 +294,8 @@ void XmaContextNew::Release() {
 
   set_is_allocated(false);
   auto context_ptr = memory()->TranslateVirtual(guest_ptr());
+  current_frame_remaining_subframes_ = 0;
+  last_stored_read_offset_ = UINT32_MAX;
   std::memset(context_ptr, 0, sizeof(XMA_CONTEXT_DATA));  // Zero it.
 }
 
@@ -401,15 +418,13 @@ void XmaContextNew::Decode(XMA_CONTEXT_DATA* data) {
 
   input_buffer_.fill(0);
 
-  // Detect if we're about to decode the loop end frame (before
-  // UpdateLoopStatus may reset the offset).
+  // Each pass decodes the loop end frame before jumping back to loop_start,
+  // so UpdateLoopStatus runs after it is decoded.
   bool is_loop_end_frame = false;
   if (data->loop_count > 0) {
     const uint32_t loop_end = std::max(kBitsPerPacketHeader, data->loop_end);
     is_loop_end_frame = (data->input_buffer_read_offset == loop_end);
   }
-
-  UpdateLoopStatus(data);
 
   if (!data->output_buffer_block_count) {
     XELOGE("XmaContext {}: Error - Received 0 for output_buffer_block_count!",
@@ -616,6 +631,24 @@ void XmaContextNew::Decode(XMA_CONTEXT_DATA* data) {
       }
       loop_start_skip_pending_ = false;
     }
+
+    // Decode position start: skip the leading subframes the game asked for,
+    // then clear the count.
+    if (data->output_buffer_padding) {
+      const uint8_t skip = data->output_buffer_padding << data->is_stereo;
+      if (skip < current_frame_remaining_subframes_) {
+        XELOGAPU(
+            "XmaContext {}: Decode position - skipping {} leading subframes",
+            id(), skip);
+        current_frame_remaining_subframes_ -= skip;
+      }
+      data->output_buffer_padding = 0;
+    }
+  }
+
+  if (is_loop_end_frame) {
+    UpdateLoopStatus(data);
+    return;
   }
 
   // Compute where to go next.
@@ -917,8 +950,9 @@ int XmaContextNew::PrepareDecoder(int sample_rate, bool is_two_channel) {
 
   // Re-initialize the context with new sample rate and channels.
   uint32_t channels = is_two_channel ? 2 : 1;
-  if (av_context_->sample_rate != sample_rate ||
+  if (reset_decoder_ || av_context_->sample_rate != sample_rate ||
       av_context_->ch_layout.nb_channels != (int)channels) {
+    reset_decoder_ = false;
     XELOGAPU("XmaContext {}: Codec reinit: rate {} -> {}, channels {} -> {}",
              id(), av_context_->sample_rate, sample_rate,
              av_context_->ch_layout.nb_channels, channels);
@@ -993,9 +1027,13 @@ void XmaContextNew::StoreContextMerged(const XMA_CONTEXT_DATA& data,
     fresh.input_buffer_1_valid = 0;
   }
 
-  // DWORD 1: decoder conditionally clears output_buffer_valid
+  // DWORD 1: decoder conditionally clears output_buffer_valid, and clears the
+  // decode position's start subframe once it has skipped them
   if (initial_data.output_buffer_valid && !data.output_buffer_valid) {
     fresh.output_buffer_valid = 0;
+  }
+  if (initial_data.output_buffer_padding && !data.output_buffer_padding) {
+    fresh.output_buffer_padding = 0;
   }
 
   // DWORD 2: decoder owns input_buffer_read_offset, error_status
@@ -1009,6 +1047,7 @@ void XmaContextNew::StoreContextMerged(const XMA_CONTEXT_DATA& data,
   fresh.output_buffer_read_offset = data.output_buffer_read_offset;
 
   fresh.Store(context_ptr);
+  last_stored_read_offset_ = fresh.input_buffer_read_offset;
 }
 
 }  // namespace apu

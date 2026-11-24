@@ -110,21 +110,11 @@ void ContentListDialog::OnEntryDraw(ImGuiIO& io, const XContentType type,
   const auto start_position = ImGui::GetCursorPos();
   // First Column
   ImGui::TableSetColumnIndex(0);
-  if (entry.icon) {
-    ImGui::Image(reinterpret_cast<ImTextureID>(entry.icon.get()),
-                 ui::default_image_icon_size);
-  } else {
-    ImGui::Dummy(ui::default_image_icon_size);
-  }
+  ui::TitleIcon(entry.icon.get());
 
   // Second Column
   ImGui::TableNextColumn();
-  if (entry.is_package) {
-    ImGui::Text("Name: %s (Filename: %s)", xe::to_utf8(entry.name).c_str(),
-                xe::path_to_utf8(entry.path.filename()).c_str());
-  } else {
-    ImGui::Text("Name: %s", xe::to_utf8(entry.name).c_str());
-  }
+  ImGui::Text("Name: %s", xe::to_utf8(entry.name).c_str());
 
   if (!entry.title_name.empty()) {
     ImGui::Text("Title Name: %s (Title ID: %s)",
@@ -137,6 +127,10 @@ void ContentListDialog::OnEntryDraw(ImGuiIO& io, const XContentType type,
   ImGui::Text("Content Installation Type: %s",
               entry.is_package ? "Package" : "Directory");
   ImGui::Text("Installation Size: %s", size_to_string(entry.size).c_str());
+  if (entry.is_package) {
+    ImGui::Text("Filename: %s",
+                xe::path_to_utf8(entry.path.filename()).c_str());
+  }
 
   // Third Column
   ImGui::TableNextColumn();
@@ -294,7 +288,8 @@ void ContentListDialog::ExecutePendingDeletion() {
     return;
   }
 
-  std::filesystem::remove_all(file_to_delete);
+  std::error_code ec;
+  std::filesystem::remove_all(file_to_delete, ec);
 
   // Remove header file for "directory" type packages
   if (is_directory_package) {
@@ -302,23 +297,30 @@ void ContentListDialog::ExecutePendingDeletion() {
         file_to_delete.parent_path().parent_path() /
         kernel::xam::kGameContentHeaderDirName /
         fmt::format("{:08X}", static_cast<uint32_t>(type)) /
-        (file_to_delete.filename().string() + ".header");
-    std::error_code ec;
+        (file_to_delete.filename() += ".header");
     std::filesystem::remove(header_path, ec);  // fine if it doesn't exist
   }
 
   for (auto path = file_to_delete.parent_path();
-       path.filename() != kernel::xam::kCommonContentDirectory;
+       path.filename() != kernel::xam::kCommonContentDirectory &&
+       path != path.parent_path();
        path = path.parent_path()) {
+    if (!std::filesystem::exists(path, ec)) {
+      continue;
+    }
+
     const auto dirs = xe::filesystem::ListDirectories(path);
     const bool header_dir =
         dirs.size() == 1 && xe::path_to_utf8(dirs[0].name.filename()) ==
                                 kernel::xam::kGameContentHeaderDirName;
 
-    if (!std::filesystem::is_empty(path) && !header_dir) {
+    const bool is_empty = std::filesystem::is_empty(path, ec);
+
+    if (ec || (!is_empty && !header_dir)) {
       break;
     }
-    std::filesystem::remove_all(path);
+
+    std::filesystem::remove_all(path, ec);
   }
 }
 

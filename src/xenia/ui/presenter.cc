@@ -68,6 +68,10 @@ DEFINE_int32(
     "maintain aspect ratio without letterboxing or stretching.",
     "Display");
 
+DEFINE_bool(fps_overlay, false,
+            "Show the frame rate in the top left corner of the window.",
+            "Display");
+
 namespace xe {
 namespace ui {
 
@@ -276,7 +280,8 @@ void Presenter::PaintFromUIThread(bool force_paint) {
       // is consistent with painting from the UI thread.
       SetPaintModeFromUIThread(PaintMode::kUIThreadOnRequest);
 
-      // Limit the frame rate of the UI, usually to the monitor refresh rate,
+      // Limit the frame rate of the UI, to the guest output refresh rate if
+      // it's being refreshed, otherwise usually to the monitor refresh rate,
       // in a way so that the UI won't be stealing all the remaining GPU
       // resources if it's repainted continuously, and the window system itself
       // doesn't limit the frame rate.
@@ -418,6 +423,22 @@ bool Presenter::RefreshGuestOutput(
     guest_output_mailbox_writable_ =
         (3 - last_acquired - guest_output_mailbox_writable_) % 3;
   }
+
+  // Let a UI thread paint waiting for the guest output proceed with this
+  // frame.
+  {
+    std::lock_guard<std::mutex> guest_output_refresh_wait_lock(
+        guest_output_refresh_wait_mutex_);
+    std::chrono::steady_clock::time_point refresh_time =
+        std::chrono::steady_clock::now();
+    if (guest_output_refresh_count_) {
+      guest_output_refresh_interval_ =
+          refresh_time - guest_output_last_refresh_time_;
+    }
+    guest_output_last_refresh_time_ = refresh_time;
+    ++guest_output_refresh_count_;
+  }
+  guest_output_refresh_wait_condition_.notify_all();
 
   // Trigger the presentation on the host.
   PaintResult paint_result = PaintResult::kNotPresented;
@@ -1055,6 +1076,101 @@ void Presenter::ExecuteUIDrawersFromUIThread(UIDrawContext& ui_draw_context) {
   ++ui_draw_current_;
 }
 
+void Presenter::ToggleFrameRateOverlay() {
+  OVERRIDE_bool(fps_overlay, !cvars::fps_overlay);
+}
+
+const std::vector<Presenter::GuestOutputPaintFlow::ClearRectangle>&
+Presenter::LayOutFrameRateOverlay(uint32_t surface_width,
+                                  uint32_t surface_height,
+                                  size_t& shadow_count_out) {
+  frame_rate_overlay_rectangles_.clear();
+  shadow_count_out = 0;
+
+  if (!cvars::fps_overlay || !frame_rate_source_) {
+    return frame_rate_overlay_rectangles_;
+  }
+
+  // The overlay's 5x7 font, a byte per row with the leftmost column in bit 4.
+  struct FrameRateOverlayGlyph {
+    char character;
+    uint8_t rows[7];
+  };
+
+  static constexpr FrameRateOverlayGlyph kFrameRateOverlayGlyphs[] = {
+      {'0', {0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E}},
+      {'1', {0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E}},
+      {'2', {0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F}},
+      {'3', {0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E}},
+      {'4', {0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02}},
+      {'5', {0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E}},
+      {'6', {0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E}},
+      {'7', {0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08}},
+      {'8', {0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E}},
+      {'9', {0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C}},
+      {'.', {0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C}},
+      {'F', {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10}},
+      {'P', {0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10}},
+      {'S', {0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E}},
+  };
+
+  char text[32];
+  const char* const text_end =
+      fmt::format_to_n(text, sizeof(text), "{:.2f} FPS", frame_rate_source_())
+          .out;
+
+  // A font pixel is 3 surface pixels at 1080p.
+  const uint32_t scale = std::max(uint32_t(1), (surface_height + 180) / 360);
+  const uint32_t margin = 4 * scale;
+
+  // The shadow is the text a font pixel down and to the right.
+  for (const uint32_t offset : {scale, uint32_t(0)}) {
+    uint32_t glyph_x = margin + offset;
+    for (const char* c = text; c != text_end; ++c, glyph_x += 6 * scale) {
+      const auto glyph = std::ranges::find(kFrameRateOverlayGlyphs, *c,
+                                           &FrameRateOverlayGlyph::character);
+
+      if (glyph == std::end(kFrameRateOverlayGlyphs)) {
+        continue;
+      }
+
+      for (uint32_t row = 0; row < 7; ++row) {
+        const uint32_t y = margin + offset + row * scale;
+        const uint32_t bits = glyph->rows[row];
+
+        // A rectangle per run of lit columns.
+        uint32_t column = 0;
+        while (column < 5) {
+          if (!(bits & (0x10 >> column))) {
+            ++column;
+            continue;
+          }
+
+          uint32_t run_end = column + 1;
+          while (run_end < 5 && (bits & (0x10 >> run_end))) {
+            ++run_end;
+          }
+
+          const uint32_t x = glyph_x + column * scale;
+          if (x < surface_width && y < surface_height) {
+            frame_rate_overlay_rectangles_.push_back(
+                {x, y, std::min((run_end - column) * scale, surface_width - x),
+                 std::min(scale, surface_height - y)});
+          }
+
+          column = run_end;
+        }
+      }
+    }
+
+    if (offset) {
+      shadow_count_out = frame_rate_overlay_rectangles_.size();
+    }
+  }
+
+  return frame_rate_overlay_rectangles_;
+}
+
 void Presenter::SetPaintModeFromUIThread(PaintMode new_mode) {
   // Can be modified only from the UI thread, so can skip locking if it's the
   // same.
@@ -1356,7 +1472,40 @@ void Presenter::UpdateUITicksNeededFromUIThread() {
 #endif
 }
 
+bool Presenter::WaitForGuestOutputRefreshFromUIThread() {
+  std::unique_lock<std::mutex> guest_output_refresh_wait_lock(
+      guest_output_refresh_wait_mutex_);
+  auto paint_requested = [this]() {
+    return guest_output_refresh_wait_force_requested_ ||
+           guest_output_refresh_count_ !=
+               guest_output_refresh_count_last_ui_paint_;
+  };
+  if (!paint_requested()) {
+    // Wait only if the next refresh is expected soon - the guest output has
+    // been refreshed recently, and not too long after the previous refresh.
+    std::chrono::steady_clock::time_point wait_end =
+        guest_output_last_refresh_time_ + kGuestOutputRefreshWaitTimeout;
+    if (guest_output_refresh_interval_ >= kGuestOutputRefreshWaitTimeout ||
+        std::chrono::steady_clock::now() >= wait_end ||
+        !guest_output_refresh_wait_condition_.wait_until(
+            guest_output_refresh_wait_lock, wait_end, paint_requested)) {
+      return false;
+    }
+  }
+  guest_output_refresh_wait_force_requested_ = false;
+  guest_output_refresh_count_last_ui_paint_ = guest_output_refresh_count_;
+  return true;
+}
+
 void Presenter::WaitForUITickFromUIThread() {
+  if (!ui_drawers_.empty() && WaitForGuestOutputRefreshFromUIThread()) {
+#if XE_PLATFORM_WIN32
+    // The forced tick, if there was one, has been satisfied.
+    std::scoped_lock<std::mutex> dxgi_ui_tick_lock(dxgi_ui_tick_mutex_);
+    dxgi_ui_tick_force_requested_ = false;
+#endif  // XE_PLATFORM
+    return;
+  }
 #if XE_PLATFORM_WIN32
   if (!AreUITicksNeededFromUIThread()) {
     return;
@@ -1382,10 +1531,31 @@ void Presenter::WaitForUITickFromUIThread() {
     }
     dxgi_ui_tick_signal_condition_.wait(dxgi_ui_tick_lock);
   }
+#else
+  if (!AreUITicksNeededFromUIThread()) {
+    return;
+  }
+  // Guest output refreshes and forced ticks interrupt the wait, and are then
+  // consumed by the next WaitForGuestOutputRefreshFromUIThread.
+  std::unique_lock<std::mutex> guest_output_refresh_wait_lock(
+      guest_output_refresh_wait_mutex_);
+  guest_output_refresh_wait_condition_.wait_until(
+      guest_output_refresh_wait_lock, ui_tick_next_time_, [this]() {
+        return guest_output_refresh_wait_force_requested_ ||
+               guest_output_refresh_count_ !=
+                   guest_output_refresh_count_last_ui_paint_;
+      });
+  ui_tick_next_time_ = std::chrono::steady_clock::now() + kUITickInterval;
 #endif  // XE_PLATFORM
 }
 
 void Presenter::ForceUIThreadPaintTick() {
+  {
+    std::lock_guard<std::mutex> guest_output_refresh_wait_lock(
+        guest_output_refresh_wait_mutex_);
+    guest_output_refresh_wait_force_requested_ = true;
+  }
+  guest_output_refresh_wait_condition_.notify_all();
 #if XE_PLATFORM_WIN32
   std::scoped_lock<std::mutex> dxgi_ui_tick_lock(dxgi_ui_tick_mutex_);
   dxgi_ui_tick_force_requested_ = true;

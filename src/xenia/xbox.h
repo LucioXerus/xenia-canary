@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <utility>
 
 #include "xenia/base/assert.h"
 // clang-format off
@@ -62,17 +63,20 @@ typedef uint32_t X_STATUS;
 #define X_STATUS_INVALID_PAGE_PROTECTION                ((X_STATUS)0xC0000045L)
 #define X_STATUS_MUTANT_NOT_OWNED                       ((X_STATUS)0xC0000046L)
 #define X_STATUS_SEMAPHORE_LIMIT_EXCEEDED               ((X_STATUS)0xC0000047L)
+#define X_STATUS_SUSPEND_COUNT_EXCEEDED                 ((X_STATUS)0xC000004AL)
 #define X_STATUS_THREAD_IS_TERMINATING                  ((X_STATUS)0xC000004BL)
 #define X_STATUS_PROCEDURE_NOT_FOUND                    ((X_STATUS)0xC000007AL)
 #define X_STATUS_INVALID_IMAGE_FORMAT                   ((X_STATUS)0xC000007BL)
 #define X_STATUS_DISK_FULL                              ((X_STATUS)0xC000007FL)
 #define X_STATUS_INSUFFICIENT_RESOURCES                 ((X_STATUS)0xC000009AL)
+#define X_STATUS_FREE_VM_NOT_AT_BASE                    ((X_STATUS)0xC000009FL)
 #define X_STATUS_MEMORY_NOT_ALLOCATED                   ((X_STATUS)0xC00000A0L)
 #define X_STATUS_FILE_IS_A_DIRECTORY                    ((X_STATUS)0xC00000BAL)
 #define X_STATUS_NOT_SUPPORTED                          ((X_STATUS)0xC00000BBL)
 #define X_STATUS_INVALID_PARAMETER_1                    ((X_STATUS)0xC00000EFL)
 #define X_STATUS_INVALID_PARAMETER_2                    ((X_STATUS)0xC00000F0L)
 #define X_STATUS_INVALID_PARAMETER_3                    ((X_STATUS)0xC00000F1L)
+#define X_STATUS_DIRECTORY_NOT_EMPTY                    ((X_STATUS)0xC0000101L)
 #define X_STATUS_NOT_A_DIRECTORY                        ((X_STATUS)0xC0000103L)
 #define X_STATUS_PROCESS_IS_TERMINATING                 ((X_STATUS)0xC000010AL)
 #define X_STATUS_DLL_NOT_FOUND                          ((X_STATUS)0xC0000135L)
@@ -439,6 +443,58 @@ enum class XOnlineCountry : uint32_t {
   kYemen = 108,
   kSouthAfrica = 109,
   kZimbabwe = 110
+};
+
+// {country, features}
+inline constexpr std::pair<XOnlineCountry, uint32_t> kOnlineCountryFeatures[] =
+    {
+        {XOnlineCountry::kArgentina, 4},
+        {XOnlineCountry::kAustralia, 12},
+        {XOnlineCountry::kAustria, 12},
+        {XOnlineCountry::kBelgium, 12},
+        {XOnlineCountry::kBrazil, 4},
+        {XOnlineCountry::kCanada, 12},
+        {XOnlineCountry::kChile, 0},
+        {XOnlineCountry::kColombia, 0},
+        {XOnlineCountry::kCzechRepublic, 0},
+        {XOnlineCountry::kDenmark, 12},
+        {XOnlineCountry::kEgypt, 0},
+        {XOnlineCountry::kFinland, 12},
+        {XOnlineCountry::kFrance, 12},
+        {XOnlineCountry::kGermany, 12},
+        {XOnlineCountry::kGreece, 0},
+        {XOnlineCountry::kHongKong, 4},
+        {XOnlineCountry::kHungary, 0},
+        {XOnlineCountry::kIndia, 0},
+        {XOnlineCountry::kIreland, 12},
+        {XOnlineCountry::kIsrael, 0},
+        {XOnlineCountry::kItaly, 12},
+        {XOnlineCountry::kJapan, 8},
+        {XOnlineCountry::kKorea, 4},
+        {XOnlineCountry::kMalaysia, 0},
+        {XOnlineCountry::kMexico, 12},
+        {XOnlineCountry::kNetherlands, 12},
+        {XOnlineCountry::kNewZealand, 12},
+        {XOnlineCountry::kNorway, 12},
+        {XOnlineCountry::kPoland, 4},
+        {XOnlineCountry::kPortugal, 4},
+        // Not a public country, xam lists it with no features.
+        {static_cast<XOnlineCountry>(236), 0},
+        {XOnlineCountry::kRussianFederation, 0},
+        {XOnlineCountry::kSaudiArabia, 0},
+        {XOnlineCountry::kSingapore, 4},
+        {XOnlineCountry::kSlovakRepublic, 0},
+        {XOnlineCountry::kSouthAfrica, 0},
+        {XOnlineCountry::kSpain, 12},
+        {XOnlineCountry::kSweden, 12},
+        {XOnlineCountry::kSwitzerland, 12},
+        {XOnlineCountry::kTaiwan, 4},
+        {XOnlineCountry::kThailand, 0},
+        {XOnlineCountry::kTurkey, 4},
+        {XOnlineCountry::kGreatBritain, 12},
+        {XOnlineCountry::kUnitedArabEmirates, 0},
+        {XOnlineCountry::kUnitedStates, 12},
+        {XOnlineCountry::kVietNam, 0},
 };
 
 enum class XContentType : uint32_t {

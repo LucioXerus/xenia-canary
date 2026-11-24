@@ -222,8 +222,18 @@ WaitResult Wait(WaitHandle* wait_handle, bool is_alertable,
   if (bAlertable) {
     result = WaitForSingleObjectEx(handle, timeout_dw, bAlertable);
   } else {
+    // Windows restarts a relative timeout after a suspend, so use an absolute
+    // due time.
     LARGE_INTEGER timeout_big;
-    timeout_big.QuadPart = -10000LL * static_cast<int64_t>(timeout_dw);
+    if (timeout_dw && timeout_dw != INFINITE) {
+      FILETIME now;
+      GetSystemTimePreciseAsFileTime(&now);
+      timeout_big.QuadPart =
+          ((int64_t(now.dwHighDateTime) << 32) | now.dwLowDateTime) +
+          10000LL * static_cast<int64_t>(timeout_dw);
+    } else {
+      timeout_big.QuadPart = -10000LL * static_cast<int64_t>(timeout_dw);
+    }
 
     result = NtWaitForSingleObjectPointer.invoke<NTSTATUS>(
         handle, bAlertable, timeout_dw == INFINITE ? nullptr : &timeout_big);
@@ -414,7 +424,8 @@ class Win32Timer : public Win32Handle<Timer> {
 
  public:
   explicit Win32Timer(HANDLE handle) : Win32Handle(handle) {}
-  ~Win32Timer() = default;
+  // The repeating item uses the handle, so stop it first.
+  ~Win32Timer() override { DisarmRepeating(); }
 
   bool SetOnceAfter(xe::chrono::hundrednanoseconds rel_time,
                     std::function<void()> opt_callback) override {
@@ -427,6 +438,7 @@ class Win32Timer : public Win32Handle<Timer> {
   }
   bool SetOnceAt(WClock_::time_point due_time,
                  std::function<void()> opt_callback) override {
+    DisarmRepeating();
     std::lock_guard<std::mutex> lock(mutex_);
     callback_ = std::move(opt_callback);
     LARGE_INTEGER due_time_li;
@@ -443,32 +455,56 @@ class Win32Timer : public Win32Handle<Timer> {
   bool SetRepeatingAfter(
       xe::chrono::hundrednanoseconds rel_time, std::chrono::milliseconds period,
       std::function<void()> opt_callback = nullptr) override {
-    return SetRepeatingAt(WClock_::now() + rel_time, period,
+    return SetRepeatingAt(GClock_::now() + rel_time, period,
+                          std::move(opt_callback));
+  }
+  // A periodic waitable timer re-arms from when it fired, rounded up to the
+  // clock tick, so a 16 ms period fires every 31.25 ms on the default tick.
+  // The timer queue schedules each fire from the previous due time instead.
+  bool SetRepeatingAt(WClock_::time_point due_time,
+                      std::chrono::milliseconds period,
+                      std::function<void()> opt_callback) override {
+    return SetRepeatingAt(date::clock_cast<GClock_>(due_time), period,
                           std::move(opt_callback));
   }
   bool SetRepeatingAt(GClock_::time_point due_time,
                       std::chrono::milliseconds period,
-                      std::function<void()> opt_callback = nullptr) override {
-    return SetRepeatingAt(date::clock_cast<WClock_>(due_time), period,
-                          std::move(opt_callback));
-  }
-  bool SetRepeatingAt(WClock_::time_point due_time,
-                      std::chrono::milliseconds period,
                       std::function<void()> opt_callback) override {
-    std::lock_guard<std::mutex> lock(mutex_);
-    callback_ = std::move(opt_callback);
-    LARGE_INTEGER due_time_li;
-    due_time_li.QuadPart = WClock_::to_file_time(due_time);
-    auto completion_routine =
-        callback_ ? reinterpret_cast<PTIMERAPCROUTINE>(CompletionRoutine)
-                  : NULL;
-    return SetWaitableTimer(handle_, &due_time_li, int32_t(period.count()),
-                            completion_routine, this, false)
-               ? true
-               : false;
+    DisarmRepeating();
+
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      callback_ = nullptr;
+      // Unsignalled until the first fire
+      if (!CancelWaitableTimer(handle_)) {
+        return false;
+      }
+    }
+
+    // The item holds the callback, as a Cancel waiting on the item may hold
+    // mutex_.
+    HANDLE handle = handle_;
+    auto fire = [handle, callback = std::move(opt_callback)](void*) {
+      // A due time long past signals at once; one near now may wait for the
+      // next kernel clock tick.
+      LARGE_INTEGER past;
+      past.QuadPart = 1;
+      SetWaitableTimer(handle, &past, 0, NULL, NULL, false);
+
+      if (callback) {
+        callback();
+      }
+    };
+
+    auto wait_item =
+        QueueTimerRecurring(std::move(fire), nullptr, due_time, period);
+    std::lock_guard<std::mutex> lock(repeating_mutex_);
+    repeating_item_ = std::move(wait_item);
+    return true;
   }
 
   bool Cancel() override {
+    DisarmRepeating();
     // Reset the callback immediately so that any completions don't call it.
     std::lock_guard<std::mutex> lock(mutex_);
     callback_ = nullptr;
@@ -476,6 +512,19 @@ class Win32Timer : public Win32Handle<Timer> {
   }
 
  private:
+  // Waits for a running repeating fire, unless called from one.
+  void DisarmRepeating() {
+    std::weak_ptr<TimerQueueWaitItem> item;
+    {
+      std::lock_guard<std::mutex> lock(repeating_mutex_);
+      item = std::move(repeating_item_);
+      repeating_item_.reset();
+    }
+    if (auto wait_item = item.lock()) {
+      wait_item->Disarm();
+    }
+  }
+
   static void CompletionRoutine(Win32Timer* timer, DWORD timer_low,
                                 DWORD timer_high) {
     // As the callback may reset the timer, store local.
@@ -489,6 +538,8 @@ class Win32Timer : public Win32Handle<Timer> {
 
   std::mutex mutex_;
   std::function<void()> callback_;
+  std::mutex repeating_mutex_;
+  std::weak_ptr<TimerQueueWaitItem> repeating_item_;
 };
 
 std::unique_ptr<Timer> Timer::CreateManualResetTimer() {

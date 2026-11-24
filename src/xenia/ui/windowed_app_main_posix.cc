@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include "xenia/base/console_window.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/ui/windowed_app.h"
@@ -52,6 +53,7 @@ int main(int argc_pre_gtk, char** argv_pre_gtk) {
     xe::InitializeLogging(app->GetName());
 
     if (app->OnInitialize()) {
+      xe::ConsoleWindow::OpenIfEnabled();
       app_context.RunMainGTKLoop();
       result = EXIT_SUCCESS;
     } else {

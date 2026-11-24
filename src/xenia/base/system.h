@@ -23,6 +23,12 @@ bool InitializeAndroidSystemForApplicationContext();
 void ShutdownAndroidSystem();
 #endif
 
+#if XE_PLATFORM_GNU_LINUX
+// Loads the SDL3 library at runtime, as xenia-base doesn't link it.
+// Returns nullptr if it's unavailable, otherwise release it with dlclose.
+void* LoadSDL3Library();
+#endif
+
 // The URL must include the protocol.
 void LaunchWebBrowser(const std::string_view url);
 void LaunchFileExplorer(const std::filesystem::path& path);

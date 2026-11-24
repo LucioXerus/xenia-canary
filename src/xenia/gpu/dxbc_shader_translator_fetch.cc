@@ -760,7 +760,8 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
   }
 
   // Texel center snap instead of the epsilon, see CanSnapToTexelCenter.
-  bool point_snap = instr.CanSnapToTexelCenter(use_computed_lod);
+  bool point_snap =
+      cvars::texture_point_snap && instr.CanSnapToTexelCenter(use_computed_lod);
 
   // Get offsets applied to the coordinates before sampling.
   // `offsets` is used for float4 literal construction,
@@ -2410,7 +2411,7 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
                dxbc::Src::LU(UINT32_C(1) << 24));
       a_.OpIf(true, dxbc::Src::R(signs_temp, dxbc::Src::kXXXX));
       if (instr.AllowsPointSampling(use_computed_lod)) {
-        // Reconstruct point sampled 4 to 7 bit unsigned components
+        // Reconstruct point sampled 4 to 6 bit unsigned components
         // using the guest conversion (see GetIntegerScaleBits).
         a_.OpAnd(dxbc::Dest::R(signs_temp, 0b0001), integer_scale_bits_packed,
                  dxbc::Src::LU((UINT32_C(1) << 24) - 1));
