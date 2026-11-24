@@ -13,6 +13,7 @@
 #include <wayland-client.h>
 #include <xcb/xcb.h>
 
+#include <algorithm>
 #include <cstring>
 
 #include "xenia/base/assert.h"
@@ -67,6 +68,7 @@ GTKWindow::GTKWindow(WindowedAppContext& app_context,
              desired_logical_height) {}
 
 GTKWindow::~GTKWindow() {
+  *alive_ = false;
   EnterDestructor();
   if (wayland_subcompositor_) {
     wl_subcompositor_destroy(wayland_subcompositor_);
@@ -160,8 +162,23 @@ bool GTKWindow::OpenImpl() {
   // entire window around it (as well as the width of the menu actually if it
   // happens to be bigger - the desired size in the Window will be updated later
   // to reflect that).
-  gtk_widget_set_size_request(drawing_area_, GetDesiredLogicalWidth(),
-                              GetDesiredLogicalHeight());
+  uint32_t initial_width = GetDesiredLogicalWidth();
+  uint32_t initial_height = GetDesiredLogicalHeight();
+  if (!IsFullscreen()) {
+    // The stored size may not fit the current monitor, so don't request it even
+    // for the initial layout. The menu height isn't known until the menu is
+    // laid out, so it's fully accounted for after that.
+    int menu_height = 0;
+    if (main_menu_widget) {
+      int menu_minimum_height = 0;
+      gtk_widget_get_preferred_height(main_menu_widget, &menu_minimum_height,
+                                      &menu_height);
+    }
+    if (ClampLogicalSizeToMonitor(initial_width, initial_height, menu_height)) {
+      OnDesiredLogicalSizeUpdate(initial_width, initial_height);
+    }
+  }
+  gtk_widget_set_size_request(drawing_area_, initial_width, initial_height);
 
   // Attach the event handlers.
   // Keyboard events are processed by the window, mouse events are processed
@@ -187,6 +204,24 @@ bool GTKWindow::OpenImpl() {
   // Remove the size request after finishing the initial layout because it makes
   // it impossible to make the window smaller.
   gtk_widget_set_size_request(drawing_area_, -1, -1);
+
+  // The menu height wasn't known before the first layout, so shrink the window
+  // again if it turned out not to fit the monitor with the menu.
+  if (!IsFullscreen()) {
+    int menu_height = 0;
+    if (main_menu_widget) {
+      int menu_minimum_height = 0;
+      gtk_widget_get_preferred_height(main_menu_widget, &menu_minimum_height,
+                                      &menu_height);
+    }
+    uint32_t clamped_width = GetDesiredLogicalWidth();
+    uint32_t clamped_height = GetDesiredLogicalHeight();
+    if (ClampLogicalSizeToMonitor(clamped_width, clamped_height, menu_height)) {
+      OnDesiredLogicalSizeUpdate(clamped_width, clamped_height);
+      gtk_window_resize(GTK_WINDOW(window_), int(clamped_width),
+                        int(clamped_height) + menu_height);
+    }
+  }
 
   // After setting up the initial layout for non-fullscreen, enter fullscreen if
   // requested.
@@ -298,6 +333,81 @@ void GTKWindow::ApplyNewFullscreen() {
   if (destruction_receiver.IsWindowDestroyedOrClosed()) {
     return;
   }
+}
+
+void GTKWindow::ApplyNewDesiredLogicalSize() {
+  // The desired size is the size of the drawing area, while gtk_window_resize
+  // takes the size of the whole window contents, which also include the main
+  // menu outside fullscreen. The menu is detached while in fullscreen, so use
+  // its preferred height rather than the current layout. For a maximized or a
+  // fullscreen window, GTK applies the size when the window is restored.
+  int menu_height = 0;
+  const auto* main_menu = dynamic_cast<const GTKMenuItem*>(GetMainMenu());
+
+  if (main_menu && main_menu->handle()) {
+    int menu_minimum_height = 0;
+    gtk_widget_get_preferred_height(main_menu->handle(), &menu_minimum_height,
+                                    &menu_height);
+  }
+
+  uint32_t width = GetDesiredLogicalWidth();
+  uint32_t height = GetDesiredLogicalHeight();
+  // The size is restored from the config, so it may come from a different
+  // monitor, a different scale factor, or an older build - don't open a window
+  // that doesn't fit on the screen. On Wayland, a window larger than the
+  // output is reported back at its (huge) request size, which would then be
+  // persisted again.
+  if (ClampLogicalSizeToMonitor(width, height, menu_height)) {
+    // Store the clamped size as the desired one so the presenter and the
+    // persisted config reflect what's actually applied.
+    OnDesiredLogicalSizeUpdate(width, height);
+  }
+
+  // The GDK_CONFIGURE that follows reports the new actual size.
+  gtk_window_resize(GTK_WINDOW(window_), int(width),
+                    int(height) + menu_height);
+}
+
+bool GTKWindow::ClampLogicalSizeToMonitor(uint32_t& width, uint32_t& height,
+                                          int extra_height) const {
+  if (IsFullscreen() || !window_) {
+    return false;
+  }
+  GdkDisplay* display = gtk_widget_get_display(window_);
+  if (!display) {
+    return false;
+  }
+  GdkMonitor* monitor = nullptr;
+  if (GdkWindow* area_window = gtk_widget_get_window(drawing_area_)) {
+    monitor = gdk_display_get_monitor_at_window(display, area_window);
+  }
+  if (!monitor) {
+    monitor = gdk_display_get_primary_monitor(display);
+  }
+  if (!monitor) {
+    monitor = gdk_display_get_monitor(display, 0);
+  }
+  if (!monitor) {
+    return false;
+  }
+  // The work area is in logical pixels, the same space as the desired size.
+  // The vertical space of the main menu isn't part of the drawing area.
+  GdkRectangle workarea;
+  gdk_monitor_get_workarea(monitor, &workarea);
+  const int max_width = workarea.width;
+  const int max_height = workarea.height - extra_height;
+  if (max_width <= 0 || max_height <= 0) {
+    return false;
+  }
+  const uint32_t clamped_width = std::min<uint32_t>(width, uint32_t(max_width));
+  const uint32_t clamped_height =
+      std::min<uint32_t>(height, uint32_t(max_height));
+  if (clamped_width == width && clamped_height == height) {
+    return false;
+  }
+  width = clamped_width;
+  height = clamped_height;
+  return true;
 }
 
 void GTKWindow::ApplyNewTitle() {
@@ -443,7 +553,46 @@ std::unique_ptr<Surface> GTKWindow::CreateSurfaceImpl(
   return nullptr;
 }
 
-void GTKWindow::RequestPaintImpl() { gtk_widget_queue_draw(drawing_area_); }
+void GTKWindow::RequestPaintImpl() {
+  // May be called from the guest output thread, but painting must be done in
+  // the UI thread.
+  // Painting directly rather than via gtk_widget_queue_draw, as GTK defers
+  // draws to its own frame clock, while guest output frames need to be painted
+  // as soon as they're ready, and the presenter limits the frame rate of the UI
+  // itself.
+  if (paint_requested_.exchange(true, std::memory_order_relaxed)) {
+    return;
+  }
+  // Not via CallInUIThread, as a paint may request the next one, and pending
+  // functions are executed until there are none left, which would never let
+  // the main loop handle events. With the same priority as pending functions
+  // so neither can starve the other.
+  gdk_threads_add_idle_full(
+      G_PRIORITY_DEFAULT_IDLE, PaintIdleHandler,
+      new std::pair<GTKWindow*, std::shared_ptr<bool>>(this, alive_),
+      [](gpointer data) {
+        delete static_cast<std::pair<GTKWindow*, std::shared_ptr<bool>>*>(data);
+      });
+}
+
+gboolean GTKWindow::PaintIdleHandler(gpointer data) {
+  const auto& request =
+      *static_cast<std::pair<GTKWindow*, std::shared_ptr<bool>>*>(data);
+  if (!*request.second) {
+    return G_SOURCE_REMOVE;
+  }
+  GTKWindow* window = request.first;
+  window->paint_requested_.store(false, std::memory_order_relaxed);
+  if (!window->drawing_area_) {
+    return G_SOURCE_REMOVE;
+  }
+  if (window->batched_size_update_depth_) {
+    window->batched_size_update_contained_draw_ = true;
+  } else {
+    window->OnPaint();
+  }
+  return G_SOURCE_REMOVE;
+}
 
 void GTKWindow::UpdateWaylandSubsurfaceGeometry() {
   if (!window_ || !drawing_area_) {
